@@ -14,7 +14,9 @@ constexpr DWORD kHelperTimeoutMs = 200;
 int g_rtMode = 0;  // 0 off, 1 copy, 2 invert, 3 DLAA
 resource g_depthRes = {0};  // this frame's pre-pass target (packed depth), set at its first bind
 int g_lastSentMode = -1;
+int g_dlssPreset = -1;  // NVSDK_NGX_DLSS_Hint_Render_Preset_*, -1 automatic
 IDirect3DDevice9Ex* g_d9 = nullptr;
+bool g_noEx = false;  // the game's device isn't D3D9Ex (RenoDX missing)
 SharedControl* g_ctl = nullptr;
 HANDLE g_map = nullptr, g_go = nullptr, g_done = nullptr;
 PROCESS_INFORMATION g_helper = {};
@@ -161,7 +163,7 @@ void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
         memcpy(g_ctl->prevViewProj, g_prevVp, sizeof(g_ctl->prevViewProj));
         g_ctl->havePrev = g_havePrevVp ? 1 : 0;
         g_ctl->reset = static_cast<int>(g_ctl->mode) != g_lastSentMode ? 1 : 0;
-        g_ctl->preset = -1;
+        g_ctl->preset = g_dlssPreset;
         g_lastSentMode = static_cast<int>(g_ctl->mode);
         QueryPerformanceCounter(&t1);
         ResetEvent(g_done);  // a late answer to an earlier frame must not count for this one
@@ -186,9 +188,10 @@ void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
             if (++g_rtFrames == 1 || g_rtFrames % 600 == 0)
                 Log("round trip %llu: %.2f ms total, %.2f ms helper (helper's own %.2f ms)",
                     static_cast<unsigned long long>(g_rtFrames), total, wait, g_ctl->helperGpuMs);
-            g_rtStatus = Format("%s: %.2f ms per frame (helper %.2f ms), %llu frames; %s",
-                                g_rtMode == 3 ? "DLAA" : g_rtMode == 2 ? "invert" : "copy", g_rtMsAvg, g_rtWaitAvg,
-                                static_cast<unsigned long long>(g_rtFrames), g_ctl->helperStatus);
+            g_rtStatus = Format("%s: %.2f ms per frame (helper %.2f ms). %s",
+                                g_rtMode == 3 ? (g_ctl->mode == kModeDlaa ? "DLAA" : "DLAA (waiting for the 3D scene)")
+                                : g_rtMode == 2 ? "Invert test" : "Copy test",
+                                g_rtMsAvg, g_rtWaitAvg, g_ctl->helperStatus);
         }
     } else {
         g_rtStatus = "copy into the shared texture failed";

@@ -46,7 +46,7 @@
 #include "version.h"
 
 extern "C" __declspec(dllexport) const char* NAME = RD_PRODUCT;
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLAA for " RD_GAME " (in development: frame capture probe).";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLAA (NVIDIA DLSS at native resolution) for " RD_GAME ", through a 64-bit helper process.";
 
 namespace {
 
@@ -497,7 +497,10 @@ void OnInitDevice(device* dev) {
     Log("device: D3D9 %p, IDirect3DDevice9Ex: %s (hr 0x%08lx)", d9, SUCCEEDED(hr) && ex ? "yes" : "no", hr);
     if (ex) {
         g_d9 = ex;  // kept for the device's lifetime (round trip)
+        g_noEx = false;
         ex->Release();
+    } else {
+        g_noEx = true;
     }
 }
 
@@ -979,23 +982,84 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
     }
 }
 
+// ---------------------------------------------------------------- settings
+//
+// ReShade.ini [RE6DLSS]: AntiAliasing (0 off, 1 DLAA; default DLAA), DlssModel (0 Automatic,
+// 1 K, 2 J, 3 L, 4 M). The developer tools (round trip test, jitter test, frame capture) are not
+// saved, except CaptureHotkey.
+
+int g_aa = 1;
+int g_model = 0;
+int g_debugRoundTrip = 0;  // 0 none, 1 copy, 2 invert (overrides DLAA while set)
+bool g_jitterTest = false;
+const char* const kModels[] = {"Automatic", "K", "J", "L", "M"};
+const int kModelPreset[] = {-1, 11, 10, 12, 13};  // NVSDK_NGX_DLSS_Hint_Render_Preset_*
+
+void ApplySettings() {
+    g_rtMode = g_debugRoundTrip ? g_debugRoundTrip : (g_aa ? 3 : 0);
+    g_jitterMode = g_jitterTest ? 2 : (g_aa || g_debugRoundTrip ? 1 : 0);
+    g_dlssPreset = kModelPreset[g_model];
+    g_rtFailed = false;
+}
+
+void LoadSettings() {
+    reshade::get_config_value(nullptr, RD_PRODUCT, "CaptureHotkey", g_captureHotkey);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "AntiAliasing", g_aa);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "DlssModel", g_model);
+    if (g_aa < 0 || g_aa > 1) g_aa = 1;
+    if (g_model < 0 || g_model > 4) g_model = 0;
+    ApplySettings();
+    Log("settings: anti-aliasing %s, DLSS model %s", g_aa ? "DLAA" : "off", kModels[g_model]);
+}
+
+void SaveSettings() {
+    reshade::set_config_value(nullptr, RD_PRODUCT, "AntiAliasing", g_aa);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "DlssModel", g_model);
+    ApplySettings();
+}
+
 // ---------------------------------------------------------------- overlay
 
-void DrawOverlay(effect_runtime*) {
-    ImGui::TextUnformatted(RD_PRODUCT " " RD_VERSION ": probe build (no DLSS yet)");
-    {
-        static const char* const kModes[] = {"Off", "Copy (should look unchanged)", "Invert (should look inverted)", "DLAA"};
-        if (ImGui::Combo("Helper round trip", &g_rtMode, kModes, 4)) {
-            g_rtFailed = false;
-            reshade::set_config_value(nullptr, RD_PRODUCT, "RoundTrip", g_rtMode);
-        }
-        ImGui::TextDisabled("%s", g_rtMode ? g_rtStatus.c_str() : "off");
-        static const char* const kJit[] = {"Off", "On (picture shimmers until DLAA is in)", "Test: 16x (plainly shakes)"};
-        if (ImGui::Combo("Jitter", &g_jitterMode, kJit, 3))
-            reshade::set_config_value(nullptr, RD_PRODUCT, "Jitter", g_jitterMode);
-        ImGui::TextDisabled("jitter %.3f, %.3f px; %u scene draws jittered last frame; camera matrix %s", g_jitterX,
-                            g_jitterY, g_jitteredDrawsLast, g_havePrevVp ? "tracked" : "not seen");
+void Help(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0f);
+        ImGui::TextUnformatted(text);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
     }
+}
+
+void DrawOverlay(effect_runtime*) {
+    ImGui::TextDisabled(RD_PRODUCT " " RD_VERSION);
+    static const char* const kAa[] = {"Off", "DLAA"};
+    if (ImGui::Combo("Anti-aliasing", &g_aa, kAa, 2)) SaveSettings();
+    Help("DLAA: NVIDIA DLSS at native resolution, in place of the game's anti-aliasing (set the game's "
+         "anti-aliasing to Off). Needs an NVIDIA RTX GPU and RenoDX. Costs about 3-4 ms per frame at 4K.");
+    ImGui::BeginDisabled(!g_aa);
+    if (ImGui::Combo("DLSS model", &g_model, kModels, 5)) SaveSettings();
+    Help("Automatic: the model NVIDIA recommends (K for DLAA). The NVIDIA app's DLSS override, if set for "
+         "this game, takes precedence.");
+    ImGui::EndDisabled();
+
+    const ImVec4 warn(1.0f, 0.75f, 0.3f, 1.0f);
+    if (g_noEx)
+        ImGui::TextColored(warn, "The game's device isn't D3D9Ex: install RenoDX for Resident Evil 6 (DLAA needs it).");
+    else if (!g_d9)
+        ImGui::TextDisabled("Waiting for the game's device...");
+    else if (g_rtMode)
+        ImGui::TextWrapped("%s", g_rtStatus.c_str());
+    else
+        ImGui::TextDisabled("Off.");
+
+    if (!ImGui::CollapsingHeader("Developer tools")) return;
+    static const char* const kTest[] = {"Off (normal)", "Copy (picture unchanged)", "Invert (picture inverted)"};
+    if (ImGui::Combo("Helper round trip test", &g_debugRoundTrip, kTest, 3)) ApplySettings();
+    if (ImGui::Checkbox("Jitter test (16x, the picture shakes)", &g_jitterTest)) ApplySettings();
+    ImGui::TextDisabled("jitter %.3f, %.3f px; %u scene draws jittered last frame; camera matrix %s", g_jitterX,
+                        g_jitterY, g_jitteredDrawsLast, g_havePrevVp ? "tracked" : "not seen");
     ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
     if (ImGui::Button(g_captureHotkey ? "Capture frame (F10)" : "Capture frame")) StartCapture();
     ImGui::EndDisabled();
@@ -1003,15 +1067,8 @@ void DrawOverlay(effect_runtime*) {
     ImGui::TextDisabled("%s", g_capture.load() == Capture::Recording ? "recording..." : g_status.c_str());
     {
         std::lock_guard<std::mutex> lock(g_pipeMutex);
-        ImGui::TextDisabled("shaders: %zu vertex, %zu pixel, %zu compute", g_counts[0], g_counts[1], g_counts[2]);
+        ImGui::TextDisabled("shaders: %zu vertex, %zu pixel", g_counts[0], g_counts[1]);
     }
-    size_t contexts;
-    {
-        std::lock_guard<std::mutex> lock(g_ctxMutex);
-        contexts = g_contexts.size();
-    }
-    ImGui::TextDisabled("device contexts: %zu; deferred command lists finished %llu, executed %llu", contexts,
-                        static_cast<unsigned long long>(g_deferredSeen.load()), static_cast<unsigned long long>(g_executes.load()));
 }
 
 }  // namespace
@@ -1025,9 +1082,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             g_self = module;
             g_veh = AddVectoredExceptionHandler(1, &OnException);
             LoadDumpList();
-            reshade::get_config_value(nullptr, RD_PRODUCT, "CaptureHotkey", g_captureHotkey);
-            reshade::get_config_value(nullptr, RD_PRODUCT, "RoundTrip", g_rtMode);
-            reshade::get_config_value(nullptr, RD_PRODUCT, "Jitter", g_jitterMode);
+            LoadSettings();
             reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
             reshade::register_event<reshade::addon_event::init_resource>(&OnInitResource);
             reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);

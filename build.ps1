@@ -5,6 +5,7 @@
 #   -Install  copies the add-on next to the game's exe (game closed).
 param(
     [switch]$Install,
+    [switch]$Package,
     [string]$GameDir = "E:\SteamLibrary\steamapps\common\Resident Evil 6"
 )
 $ErrorActionPreference = 'Stop'
@@ -58,4 +59,29 @@ if ($Install) {
     if (Get-Process ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue) { throw "Close the game first." }
     Copy-Item $addon, $helper, "$root\third_party\bin\nvngx_dlss.dll" $GameDir -Force
     Write-Host "Installed to $GameDir"
+}
+
+if ($Package) {
+    $version = [regex]::Match((Get-Content "$root\src\version.h" -Raw), 'RD_VERSION "([^"]+)"').Groups[1].Value
+    $zip = "$root\bin\release\$name-$version.zip"
+    New-Item -ItemType Directory -Force (Split-Path $zip) | Out-Null
+    if (Test-Path $zip) { Remove-Item -Force $zip }
+    # Flat zip, forward-slash entry names (Compress-Archive writes backslashes, which break on Linux).
+    $files = [ordered]@{
+        "RE6DLSS.addon32"          = $addon
+        "RE6DLSS-helper64.exe"     = $helper
+        "nvngx_dlss.dll"           = "$root\third_party\bin\nvngx_dlss.dll"
+        "README.md"                = "$root\README.md"
+        "LICENSE"                  = "$root\LICENSE"
+        "THIRD_PARTY_NOTICES.txt"  = "$root\THIRD_PARTY_NOTICES.txt"
+        "NVIDIA-DLSS-LICENSE.txt"  = "$root\third_party\dlss\LICENSE.txt"
+    }
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $z = [IO.Compression.ZipFile]::Open($zip, 'Create')
+    try {
+        foreach ($k in $files.Keys) {
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $files[$k], $k)
+        }
+    } finally { $z.Dispose() }
+    Write-Host "Packaged $zip"
 }
