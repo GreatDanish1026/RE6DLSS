@@ -31,6 +31,7 @@
 
 #include <atomic>
 #include <cstdarg>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -59,6 +60,7 @@ constexpr int kCaptureFrames = 2;
 std::mutex g_logMutex;
 FILE* g_log = nullptr;
 ULONGLONG g_loadTick = 0;
+uint32_t g_bbWidth = 0, g_bbHeight = 0;  // the game's back buffer (set at the first present)
 std::wstring g_exeDir;
 
 void LogV(const char* fmt, va_list ap) {
@@ -443,7 +445,9 @@ struct Stage {
 struct Context {
     Stage vs, ps, cs;
     float vsConst[256 * 4] = {}, psConst[224 * 4] = {};  // D3D9 float constant registers
-    bool dumpVsNext = false;                              // capture: dump VS constants at next scene draw
+    bool dumpVsNext = false;
+    bool sceneTarget = false;  // render target 0 is back-buffer sized (jitter)
+    bool jittered = false;     // c1..c4 on the device are our jittered copy                              // capture: dump VS constants at next scene draw
     viewport vp = {};
     std::vector<resource_view> rtvs;
     resource_view dsv = {0};
@@ -474,6 +478,13 @@ Stage* StageOf(Context& c, shader_stage s) {
 }
 
 #include "roundtrip.inl"
+#include "jitter.inl"
+
+void MarkTonemap(command_list* cl) {  // the tonemap draw ends the scene phase (jitter)
+    if (g_pastTonemap) return;
+    std::lock_guard<std::mutex> lock(g_ctxMutex);
+    if (Ctx(cl).ps.shader.id == kTonemapPs) g_pastTonemap = true;
+}
 
 void OnInitDevice(device* dev) {
     if (dev->get_api() != device_api::d3d9) {
@@ -552,6 +563,7 @@ void OnPushConstants(command_list* cl, shader_stage stages, pipeline_layout, uin
     if (!dst || first >= cap) return;
     if (first + count > cap) count = cap - first;
     memcpy(dst + first, values, count * 4);
+    if (dst == c.vsConst && first < 20 && first + count > 4) c.jittered = false;  // c1..c4 rewritten by the game
 }
 
 void OnBindViewports(command_list* cl, uint32_t first, uint32_t count, const viewport* vps) {
@@ -588,7 +600,6 @@ void AddLocked(Context& c, std::string line) {
 // RE6DLSS-rt-NN-<id>.bin (header: 'RT4' + NUL, width, height, format, step; then rows of
 // pixels). tools/rt2png.py turns them into PNGs.
 int g_snapshots = 0;
-uint32_t g_bbWidth = 0, g_bbHeight = 0;
 bool g_snapFrame = false;
 constexpr int kMaxSnapshots = 24;
 
@@ -661,6 +672,14 @@ void OnBindRenderTargets(command_list* cl, uint32_t count, const resource_view* 
     Context& c = Ctx(cl);
     c.rtvs.assign(rtvs, rtvs + count);
     c.dsv = dsv;
+    c.sceneTarget = false;
+    if (count && rtvs[0].handle && g_bbWidth) {
+        ViewInfo vi;
+        if (FindView(rtvs[0], &vi)) {
+            const resource_desc rd = cl->get_device()->get_resource_desc(vi.res);
+            c.sceneTarget = rd.texture.width == g_bbWidth && rd.texture.height == g_bbHeight;
+        }
+    }
     if (!Recording()) return;
     c.dumpVsNext = true;
     device* dev = cl->get_device();
@@ -777,6 +796,8 @@ void Other(command_list* cl) {
 
 bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
     MaybeRoundTrip(cl);
+    MarkTonemap(cl);
+    MaybeJitter(cl, vertices <= 4 && instances == 1);
     if (!Recording()) return false;
     if (vertices <= 4 && instances == 1) Pass(cl, false, Format("draw %u verts", vertices));
     else Other(cl);
@@ -784,6 +805,7 @@ bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, u
 }
 
 bool OnDrawIndexed(command_list* cl, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
+    MaybeJitter(cl, indices <= 6 && instances == 1);
     if (!Recording()) return false;
     if (indices <= 6 && instances == 1) Pass(cl, false, Format("draw %u indices", indices));
     else Other(cl);
@@ -912,6 +934,7 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
     }
     ++g_presents;
     g_rtDoneThisFrame = false;
+    NextJitter();
     if (!g_immediate) {
         g_immediate = q->get_native();
         const resource_desc d = sc->get_device()->get_resource_desc(sc->get_current_back_buffer());
@@ -965,6 +988,11 @@ void DrawOverlay(effect_runtime*) {
             reshade::set_config_value(nullptr, RD_PRODUCT, "RoundTrip", g_rtMode);
         }
         ImGui::TextDisabled("%s", g_rtMode ? g_rtStatus.c_str() : "off");
+        static const char* const kJit[] = {"Off", "On (picture shimmers until DLAA is in)"};
+        if (ImGui::Combo("Jitter", &g_jitterMode, kJit, 2))
+            reshade::set_config_value(nullptr, RD_PRODUCT, "Jitter", g_jitterMode);
+        ImGui::TextDisabled("jitter %.3f, %.3f px; %u scene draws jittered last frame; camera matrix %s", g_jitterX,
+                            g_jitterY, g_jitteredDrawsLast, g_havePrevVp ? "tracked" : "not seen");
     }
     ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
     if (ImGui::Button(g_captureHotkey ? "Capture frame (F10)" : "Capture frame")) StartCapture();
@@ -997,6 +1025,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             LoadDumpList();
             reshade::get_config_value(nullptr, RD_PRODUCT, "CaptureHotkey", g_captureHotkey);
             reshade::get_config_value(nullptr, RD_PRODUCT, "RoundTrip", g_rtMode);
+            reshade::get_config_value(nullptr, RD_PRODUCT, "Jitter", g_jitterMode);
             reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
             reshade::register_event<reshade::addon_event::init_resource>(&OnInitResource);
             reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);

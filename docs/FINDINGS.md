@@ -81,3 +81,12 @@ In-game AA should be off (FXAA runs after the tonemap). Next: helper proof of co
 - Title screen: **1.45 ms per frame** (helper part 0.28 ms; first frame 3.35 ms). The helper's
   D3D11 device takes ~0.3-0.7 s to start: frames are skipped until it reports alive (the first
   try with a 200 ms first-frame timeout failed). Helper exits when the game exits.
+
+## 0.0.4: jitter (2026-11-23)
+
+- src/jitter.inl: Halton(2,3), 16 phases; in the draw events before each geometry draw into a
+  back-buffer-sized target (before the tonemap draw), the game's tracked c1..c4 are written
+  jittered to the native device (x += 2jx/W * w, y -= 2jy/H * w per register); full-screen
+  passes get the game's values back. Applies only if c1..c3 look like a view-projection (z ~ w).
+  Also keeps the frame's (first geometry draw's) unjittered c1..c4 and the previous frame's.
+- Title screen: nothing jittered, no camera matrix (2D title, expected). Gameplay check pending.
