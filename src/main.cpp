@@ -477,8 +477,8 @@ Stage* StageOf(Context& c, shader_stage s) {
     return nullptr;
 }
 
-#include "roundtrip.inl"
 #include "jitter.inl"
+#include "roundtrip.inl"
 
 void MarkTonemap(command_list* cl) {  // the tonemap draw ends the scene phase (jitter)
     if (g_pastTonemap) return;
@@ -678,6 +678,7 @@ void OnBindRenderTargets(command_list* cl, uint32_t count, const resource_view* 
         if (FindView(rtvs[0], &vi)) {
             const resource_desc rd = cl->get_device()->get_resource_desc(vi.res);
             c.sceneTarget = rd.texture.width == g_bbWidth && rd.texture.height == g_bbHeight;
+            if (c.sceneTarget && !g_depthRes.handle && !g_pastTonemap) g_depthRes = vi.res;  // the frame's pre-pass
         }
     }
     if (!Recording()) return;
@@ -934,6 +935,7 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
     }
     ++g_presents;
     g_rtDoneThisFrame = false;
+    g_depthRes = {0};
     NextJitter();
     if (!g_immediate) {
         g_immediate = q->get_native();
@@ -982,14 +984,14 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
 void DrawOverlay(effect_runtime*) {
     ImGui::TextUnformatted(RD_PRODUCT " " RD_VERSION ": probe build (no DLSS yet)");
     {
-        static const char* const kModes[] = {"Off", "Copy (should look unchanged)", "Invert (should look inverted)"};
-        if (ImGui::Combo("Helper round trip", &g_rtMode, kModes, 3)) {
+        static const char* const kModes[] = {"Off", "Copy (should look unchanged)", "Invert (should look inverted)", "DLAA"};
+        if (ImGui::Combo("Helper round trip", &g_rtMode, kModes, 4)) {
             g_rtFailed = false;
             reshade::set_config_value(nullptr, RD_PRODUCT, "RoundTrip", g_rtMode);
         }
         ImGui::TextDisabled("%s", g_rtMode ? g_rtStatus.c_str() : "off");
-        static const char* const kJit[] = {"Off", "On (picture shimmers until DLAA is in)"};
-        if (ImGui::Combo("Jitter", &g_jitterMode, kJit, 2))
+        static const char* const kJit[] = {"Off", "On (picture shimmers until DLAA is in)", "Test: 16x (plainly shakes)"};
+        if (ImGui::Combo("Jitter", &g_jitterMode, kJit, 3))
             reshade::set_config_value(nullptr, RD_PRODUCT, "Jitter", g_jitterMode);
         ImGui::TextDisabled("jitter %.3f, %.3f px; %u scene draws jittered last frame; camera matrix %s", g_jitterX,
                             g_jitterY, g_jitteredDrawsLast, g_havePrevVp ? "tracked" : "not seen");

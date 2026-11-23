@@ -10,7 +10,7 @@
 // scene get the game's values back. c1..c3 must look like a view-projection (z ~ w: projection with
 // a far plane at infinity-ish), otherwise nothing is changed.
 
-int g_jitterMode = 0;          // 0 off, 1 on (ReShade.ini [RE6DLSS] Jitter)
+int g_jitterMode = 0;          // 0 off, 1 on, 2 test x16 (ReShade.ini [RE6DLSS] Jitter)
 uint32_t g_jitterIndex = 0;    // frame counter for the sequence
 float g_jitterX = 0, g_jitterY = 0;  // this frame's offset in pixels (-0.5..0.5)
 bool g_pastTonemap = false;    // set at the tonemap draw, cleared at present
@@ -41,8 +41,9 @@ void NextJitter() {  // at present
     }
     g_haveFrameVp = false;
     const uint32_t i = (g_jitterIndex++ % kJitterPhases) + 1;
-    g_jitterX = g_jitterMode ? Halton(i, 2) - 0.5f : 0.0f;
-    g_jitterY = g_jitterMode ? Halton(i, 3) - 0.5f : 0.0f;
+    const float scale = g_jitterMode == 2 ? 16.0f : 1.0f;  // 2 = test: 16x larger, plainly visible shake
+    g_jitterX = g_jitterMode ? (Halton(i, 2) - 0.5f) * scale : 0.0f;
+    g_jitterY = g_jitterMode ? (Halton(i, 3) - 0.5f) * scale : 0.0f;
 }
 
 bool LooksLikeViewProj(const float* c) {  // c = registers c1..c4 (16 floats)

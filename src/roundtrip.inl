@@ -3,19 +3,25 @@
 // Included into main.cpp's anonymous namespace. At the game's tonemap draw (ps1009a8dd, which reads
 // the HDR scene at t0) the scene is copied into a D3D9Ex shared texture, the GPU work is waited
 // for, RE6DLSS-helper64.exe is signalled, and once it signals back its output texture is copied over
-// the scene before the tonemap draw runs. Once per frame. Mode: Off / Copy / Invert (ReShade.ini
-// [RE6DLSS] RoundTrip=0/1/2).
+// the scene before the tonemap draw runs. Once per frame. Mode: Off / Copy / Invert / DLAA
+// (ReShade.ini [RE6DLSS] RoundTrip=0/1/2/3). For DLAA the game's packed depth (the first
+// back-buffer-sized target of the frame, its pre-pass) is shared too, with this frame's jitter and
+// the current and previous view-projection.
 
 constexpr uint32_t kTonemapPs = 0x1009a8dd;
 constexpr DWORD kHelperTimeoutMs = 200;
 
-int g_rtMode = 0;  // 0 off, 1 copy, 2 invert
+int g_rtMode = 0;  // 0 off, 1 copy, 2 invert, 3 DLAA
+resource g_depthRes = {0};  // this frame's pre-pass target (packed depth), set at its first bind
+int g_lastSentMode = -1;
 IDirect3DDevice9Ex* g_d9 = nullptr;
 SharedControl* g_ctl = nullptr;
 HANDLE g_map = nullptr, g_go = nullptr, g_done = nullptr;
 PROCESS_INFORMATION g_helper = {};
 IDirect3DTexture9* g_inTex = nullptr;
 IDirect3DTexture9* g_outTex = nullptr;
+IDirect3DTexture9* g_depthTex = nullptr;
+D3DFORMAT g_depthFmt = D3DFMT_UNKNOWN;
 IDirect3DQuery9* g_query = nullptr;
 UINT g_texW = 0, g_texH = 0;
 D3DFORMAT g_texFmt = D3DFMT_UNKNOWN;
@@ -75,22 +81,25 @@ void StopHelper() {
     }
 }
 
-bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt) {
-    if (g_inTex && g_texW == w && g_texH == h && g_texFmt == fmt) return true;
+bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt, D3DFORMAT depthFmt) {
+    if (g_inTex && g_texW == w && g_texH == h && g_texFmt == fmt && g_depthFmt == depthFmt) return true;
     if (g_inTex) g_inTex->Release(), g_inTex = nullptr;
     if (g_outTex) g_outTex->Release(), g_outTex = nullptr;
-    HANDLE hin = nullptr, hout = nullptr;
+    if (g_depthTex) g_depthTex->Release(), g_depthTex = nullptr;
+    HANDLE hin = nullptr, hout = nullptr, hdepth = nullptr;
     HRESULT hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_inTex, &hin);
     if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_outTex, &hout);
-    if (FAILED(hr) || !hin || !hout) {
+    if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, depthFmt, D3DPOOL_DEFAULT, &g_depthTex, &hdepth);
+    if (FAILED(hr) || !hin || !hout || !hdepth) {
         g_rtStatus = Format("shared texture creation failed (0x%08lx)", hr);
         Log("%s", g_rtStatus.c_str());
         return false;
     }
     if (!g_query && FAILED(g_d9->CreateQuery(D3DQUERYTYPE_EVENT, &g_query))) return false;
-    g_texW = w, g_texH = h, g_texFmt = fmt;
+    g_texW = w, g_texH = h, g_texFmt = fmt, g_depthFmt = depthFmt;
     g_ctl->inHandle = reinterpret_cast<uintptr_t>(hin);
     g_ctl->outHandle = reinterpret_cast<uintptr_t>(hout);
+    g_ctl->depthHandle = reinterpret_cast<uintptr_t>(hdepth);
     g_ctl->width = w, g_ctl->height = h;
     g_ctl->format = DxgiOf(fmt);
     ++g_ctl->generation;
@@ -106,7 +115,7 @@ bool WaitGpu() {  // D3D9: event query, flushed, spun until the GPU is done (100
     return true;
 }
 
-void RoundTrip(IDirect3DTexture9* scene) {
+void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
     LARGE_INTEGER t0, t1, t2, f;
     QueryPerformanceCounter(&t0);
     D3DSURFACE_DESC d;
@@ -127,18 +136,33 @@ void RoundTrip(IDirect3DTexture9* scene) {
         return;
     }
     const uint32_t generation = g_ctl->generation;
-    if (!EnsureTextures(d.Width, d.Height, d.Format)) {
+    D3DSURFACE_DESC dd = d;
+    if (depth) depth->GetLevelDesc(0, &dd);
+    if (dd.Width != d.Width || dd.Height != d.Height) depth = nullptr, dd.Format = d.Format;
+    if (!EnsureTextures(d.Width, d.Height, d.Format, dd.Format)) {
         g_rtFailed = true;
         return;
     }
     // The first frame after (re)creating the textures includes the helper opening them.
     const DWORD timeout = g_ctl->generation != generation || g_ctl->helperReady != g_ctl->generation ? 2000 : kHelperTimeoutMs;
-    IDirect3DSurface9 *src = nullptr, *in = nullptr, *out = nullptr;
+    IDirect3DSurface9 *src = nullptr, *in = nullptr, *out = nullptr, *dsrc = nullptr, *dsh = nullptr;
     scene->GetSurfaceLevel(0, &src);
     g_inTex->GetSurfaceLevel(0, &in);
     g_outTex->GetSurfaceLevel(0, &out);
+    if (depth) depth->GetSurfaceLevel(0, &dsrc);
+    g_depthTex->GetSurfaceLevel(0, &dsh);
+    const bool depthOk = dsrc && dsh && SUCCEEDED(g_d9->StretchRect(dsrc, nullptr, dsh, nullptr, D3DTEXF_NONE));
     if (src && in && out && SUCCEEDED(g_d9->StretchRect(src, nullptr, in, nullptr, D3DTEXF_NONE)) && WaitGpu()) {
-        g_ctl->mode = g_rtMode == 2 ? 1 : 0;
+        g_ctl->mode = g_rtMode == 3 ? (depthOk && g_haveFrameVp ? kModeDlaa : kModeCopy)
+                                    : g_rtMode == 2 ? kModeInvert : kModeCopy;
+        g_ctl->jitterX = g_jitterX;
+        g_ctl->jitterY = g_jitterY;
+        memcpy(g_ctl->viewProj, g_frameVp, sizeof(g_ctl->viewProj));
+        memcpy(g_ctl->prevViewProj, g_prevVp, sizeof(g_ctl->prevViewProj));
+        g_ctl->havePrev = g_havePrevVp ? 1 : 0;
+        g_ctl->reset = static_cast<int>(g_ctl->mode) != g_lastSentMode ? 1 : 0;
+        g_ctl->preset = -1;
+        g_lastSentMode = static_cast<int>(g_ctl->mode);
         QueryPerformanceCounter(&t1);
         ResetEvent(g_done);  // a late answer to an earlier frame must not count for this one
         SetEvent(g_go);
@@ -148,7 +172,7 @@ void RoundTrip(IDirect3DTexture9* scene) {
             g_rtStatus = "helper didn't answer in time; round trip off";
             Log("%s (helper status: %s)", g_rtStatus.c_str(), g_ctl->helperStatus);
             g_rtFailed = true;
-        } else if (g_ctl->helperReady != g_ctl->generation || g_ctl->helperError) {
+        } else if (g_ctl->helperReady != g_ctl->generation) {
             g_rtStatus = Format("helper error 0x%08lx: %s", static_cast<unsigned long>(g_ctl->helperError), g_ctl->helperStatus);
             Log("%s", g_rtStatus.c_str());
             g_rtFailed = true;
@@ -162,8 +186,9 @@ void RoundTrip(IDirect3DTexture9* scene) {
             if (++g_rtFrames == 1 || g_rtFrames % 600 == 0)
                 Log("round trip %llu: %.2f ms total, %.2f ms helper (helper's own %.2f ms)",
                     static_cast<unsigned long long>(g_rtFrames), total, wait, g_ctl->helperGpuMs);
-            g_rtStatus = Format("%s: %.2f ms per frame (helper %.2f ms), %llu frames", g_rtMode == 2 ? "invert" : "copy",
-                                g_rtMsAvg, g_rtWaitAvg, static_cast<unsigned long long>(g_rtFrames));
+            g_rtStatus = Format("%s: %.2f ms per frame (helper %.2f ms), %llu frames; %s",
+                                g_rtMode == 3 ? "DLAA" : g_rtMode == 2 ? "invert" : "copy", g_rtMsAvg, g_rtWaitAvg,
+                                static_cast<unsigned long long>(g_rtFrames), g_ctl->helperStatus);
         }
     } else {
         g_rtStatus = "copy into the shared texture failed";
@@ -171,6 +196,8 @@ void RoundTrip(IDirect3DTexture9* scene) {
     if (src) src->Release();
     if (in) in->Release();
     if (out) out->Release();
+    if (dsrc) dsrc->Release();
+    if (dsh) dsh->Release();
 }
 
 // Called from the draw event (before the game's draw runs).
@@ -191,6 +218,11 @@ void MaybeRoundTrip(command_list* cl) {
     IDirect3DTexture9* tex = nullptr;
     if (FAILED(res->QueryInterface(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&tex))) || !tex) return;
     g_rtDoneThisFrame = true;
-    RoundTrip(tex);
+    IDirect3DTexture9* depth = nullptr;
+    if (g_depthRes.handle)
+        reinterpret_cast<IDirect3DResource9*>(g_depthRes.handle)
+            ->QueryInterface(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&depth));
+    RoundTrip(tex, depth);
+    if (depth) depth->Release();
     tex->Release();
 }

@@ -5,3 +5,4 @@ bin/
 *.addon64
 *.log
 __pycache__/
+!third_party/bin/nvngx_dlss.dll

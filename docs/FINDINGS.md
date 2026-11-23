@@ -90,3 +90,16 @@ In-game AA should be off (FXAA runs after the tonemap). Next: helper proof of co
   passes get the game's values back. Applies only if c1..c3 look like a view-projection (z ~ w).
   Also keeps the frame's (first geometry draw's) unjittered c1..c4 and the previous frame's.
 - Title screen: nothing jittered, no camera matrix (2D title, expected). Gameplay check pending.
+
+## 0.1.0: DLAA (first version, 2026-11-23)
+
+- Add-on shares the frame's pre-pass target (packed depth; first back-buffer-sized target bound
+  each frame) as a third D3D9Ex shared texture, plus jitter and current/previous view-projection
+  (src/shared.h version 3). RoundTrip=3 = DLAA (falls back to copy when depth or the camera
+  matrix is missing).
+- Helper: decode pass (R + G/255 + B/65025 -> R32F), motion pass (position from depth with the
+  jittered VP, projected with current and previous unjittered VP; previous - current in pixels),
+  then DLSS (dlss.cpp from RE2DLSS-DX11; depth not inverted, HDR, auto exposure, MVLowRes) into
+  its own UAV texture, copied to the shared output. NGX starts with the helper.
+- Title screen: NGX ready, DLSS feature created 3840x2160 DLAA preset K; ~1.8 ms per frame
+  round trip. Gameplay quality check pending (jitter sign, MV sign, depth meaning unverified).
