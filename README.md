@@ -63,7 +63,8 @@ ReShade overlay (Home key), Add-ons tab, **RE6DLSS**; saved in `ReShade.ini` und
 ## Build
 
 `.\build.ps1 [-Install] [-Package]` (Visual Studio 2022+ with the C++ x86 and x64 tools). Builds the
-32-bit add-on and the 64-bit helper; `-Package` makes `bin\release\RE6DLSS-<version>.zip`.
+32-bit add-on and the 64-bit helper; `-Package` makes `bin\release\RE6DLSS-<version>.zip`. Put
+NVIDIA's `nvngx_dlss.dll` (310.9.16, not in the repository) in `third_party\bin` first.
 `docs/FINDINGS.md` records how the game's frames were mapped.
 
 ## Licence
