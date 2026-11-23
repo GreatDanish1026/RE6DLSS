@@ -23,6 +23,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d9.h>
 
 #define ImTextureID ImU64
 #include <imgui.h>
@@ -471,6 +472,18 @@ Stage* StageOf(Context& c, shader_stage s) {
     return nullptr;
 }
 
+void OnInitDevice(device* dev) {
+    if (dev->get_api() != device_api::d3d9) {
+        Log("device: API %u", static_cast<unsigned>(dev->get_api()));
+        return;
+    }
+    auto* d9 = reinterpret_cast<IDirect3DDevice9*>(dev->get_native());
+    IDirect3DDevice9Ex* ex = nullptr;
+    const HRESULT hr = d9 ? d9->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&ex)) : E_POINTER;
+    Log("device: D3D9 %p, IDirect3DDevice9Ex: %s (hr 0x%08lx)", d9, SUCCEEDED(hr) && ex ? "yes" : "no", hr);
+    if (ex) ex->Release();
+}
+
 void OnInitCommandList(command_list* cl) {
     std::lock_guard<std::mutex> lock(g_ctxMutex);
     Ctx(cl);
@@ -520,7 +533,12 @@ void OnPushDescriptors(command_list* cl, shader_stage stages, pipeline_layout, u
 // (register * 4) for the float constant parameter.
 void OnPushConstants(command_list* cl, shader_stage stages, pipeline_layout, uint32_t param, uint32_t first,
                      uint32_t count, const void* values) {
-    if (param != 0 || !values) return;  // param 0 = float registers (int/bool registers ignored)
+    if (!values) return;
+    static std::atomic<int> logged{0};
+    if (logged < 24) {  // learn how D3D9 constants arrive (stage, layout parameter, first, count)
+        ++logged;
+        Log("push_constants: stages 0x%x param %u first %u count %u", static_cast<unsigned>(stages), param, first, count);
+    }
     std::lock_guard<std::mutex> lock(g_ctxMutex);
     Context& c = Ctx(cl);
     float* dst = (stages & shader_stage::vertex) != 0 ? c.vsConst : (stages & shader_stage::pixel) != 0 ? c.psConst : nullptr;
@@ -559,7 +577,80 @@ void AddLocked(Context& c, std::string line) {
     c.lines.push_back("  " + std::move(line));
 }
 
+// Render target snapshots (first captured frame only): when the game switches away from a render
+// target of back-buffer size, a copy of it is read back and saved every 4th pixel to
+// RE6DLSS-rt-NN-<id>.bin (header: "RT4 ", width, height, format, step; then rows of pixels).
+// toolst2png.py turns them into PNGs.
+int g_snapshots = 0;
+uint32_t g_bbWidth = 0, g_bbHeight = 0;
+bool g_snapFrame = false;
+constexpr int kMaxSnapshots = 24;
+
+uint32_t PixelBytes(format f) {
+    switch (static_cast<uint32_t>(f)) {
+        case 10: return 8;   // rgba16f
+        case 2: return 16;   // rgba32f
+        case 16: return 8;   // rg32f
+        case 34: case 35: case 41: case 28: case 87: case 24: case 26: return 4;
+        case 54: case 56: return 2;
+        default: return 0;
+    }
+}
+
+void Snapshot(command_list* cl, resource_view rtv) {
+    if (!g_snapFrame || g_snapshots >= kMaxSnapshots || !rtv.handle) return;
+    device* dev = cl->get_device();
+    ViewInfo info;
+    if (!FindView(rtv, &info)) return;
+    const resource_desc d = dev->get_resource_desc(info.res);
+    if (d.type != resource_type::texture_2d || d.texture.width != g_bbWidth || d.texture.height != g_bbHeight) return;
+    const uint32_t bpp = PixelBytes(d.texture.format);
+    if (!bpp) return;
+    resource_desc rd = d;
+    rd.texture.levels = 1;
+    rd.heap = memory_heap::readback;
+    rd.usage = resource_usage::copy_dest;
+    rd.flags = resource_flags::none;
+    resource dst = {};
+    if (!dev->create_resource(rd, nullptr, resource_usage::copy_dest, &dst)) {
+        Log("snapshot: readback texture failed (format %u)", static_cast<unsigned>(d.texture.format));
+        return;
+    }
+    cl->copy_texture_region(info.res, 0, nullptr, dst, 0, nullptr);
+    subresource_data m = {};
+    if (dev->map_texture_region(dst, 0, nullptr, map_access::read_only, &m) && m.data) {
+        const int n = ++g_snapshots;
+        wchar_t name[96];
+        swprintf(name, 96, L"" RD_PRODUCT "-rt-%02d-%05llx.bin", n, (info.res.handle >> 4) & 0xfffff);
+        if (FILE* f = _wfopen((g_exeDir + name).c_str(), L"wb")) {
+            const uint32_t step = 4, w = d.texture.width / step, h = d.texture.height / step;
+            const uint32_t hdr[5] = {0x00345452, w, h, static_cast<uint32_t>(d.texture.format), step};
+            fwrite(hdr, 4, 5, f);
+            std::vector<uint8_t> row(static_cast<size_t>(w) * bpp);
+            for (uint32_t y = 0; y < h; ++y) {
+                const uint8_t* src = static_cast<const uint8_t*>(m.data) + static_cast<size_t>(y * step) * m.row_pitch;
+                for (uint32_t x = 0; x < w; ++x) memcpy(&row[x * bpp], src + static_cast<size_t>(x * step) * bpp, bpp);
+                fwrite(row.data(), 1, row.size(), f);
+            }
+            fclose(f);
+        }
+        dev->unmap_texture_region(dst, 0);
+        std::lock_guard<std::mutex> lock(g_ctxMutex);
+        AddLocked(Ctx(cl), Format("SNAPSHOT %d of %s", n, Describe(dev, info.res).c_str()));
+    }
+    dev->destroy_resource(dst);
+}
+
 void OnBindRenderTargets(command_list* cl, uint32_t count, const resource_view* rtvs, resource_view dsv) {
+    if (Recording() && g_snapFrame) {  // the target being switched away from
+        resource_view prev = {0};
+        {
+            std::lock_guard<std::mutex> lock(g_ctxMutex);
+            Context& c = Ctx(cl);
+            if (!c.rtvs.empty()) prev = c.rtvs[0];
+        }
+        if (prev.handle && (!count || rtvs[0].handle != prev.handle)) Snapshot(cl, prev);
+    }
     std::lock_guard<std::mutex> lock(g_ctxMutex);
     Context& c = Ctx(cl);
     c.rtvs.assign(rtvs, rtvs + count);
@@ -794,6 +885,8 @@ void StartCapture() {
         g_frame.push_back("==== capture start (deferred work recorded before this point is missing)");
     }
     g_framesLeft = kCaptureFrames;
+    g_snapshots = 0;
+    g_snapFrame = true;
     g_capture = Capture::Recording;
     Log("capture started");
 }
@@ -814,6 +907,8 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
     if (!g_immediate) {
         g_immediate = q->get_native();
         const resource_desc d = sc->get_device()->get_resource_desc(sc->get_current_back_buffer());
+        g_bbWidth = d.texture.width;
+        g_bbHeight = d.texture.height;
         const char* fn = FormatName(d.texture.format);
         Log("first present: API D3D9, back buffer %ux%u %s (format %u)", d.texture.width, d.texture.height, fn ? fn : "?",
             static_cast<unsigned>(d.texture.format));
@@ -835,6 +930,7 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
             g_frame.push_back(Format("==== PRESENT (back buffer %s), %d more", Describe(sc->get_device(), sc->get_current_back_buffer()).c_str(),
                                      g_framesLeft - 1));
         }
+        g_snapFrame = false;  // snapshots: first captured frame only
         if (--g_framesLeft <= 0) {
             WriteCapture();
             g_capture = Capture::Idle;
@@ -884,6 +980,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             g_veh = AddVectoredExceptionHandler(1, &OnException);
             LoadDumpList();
             reshade::get_config_value(nullptr, RD_PRODUCT, "CaptureHotkey", g_captureHotkey);
+            reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
             reshade::register_event<reshade::addon_event::init_resource>(&OnInitResource);
             reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
             reshade::register_event<reshade::addon_event::init_resource_view>(&OnInitView);
