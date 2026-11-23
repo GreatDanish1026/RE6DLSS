@@ -36,9 +36,24 @@ cmd /c $cmd
 if ($LASTEXITCODE) { throw "build failed" }
 Write-Host "Built $addon"
 
+# The 64-bit helper process (DLSS is 64-bit only): bin\RE6DLSS-helper64.exe
+$vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+$obj64 = "$root\bin\obj64"
+New-Item -ItemType Directory -Force $obj64 | Out-Null
+$helper = "$root\bin\$name-helper64.exe"
+$cmd = @(
+    "call `"$vcvars64`" >nul",
+    ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
+     "/Fo`"$obj64\\`" `"$root\src\helper.cpp`" user32.lib " +
+     "/link /SUBSYSTEM:WINDOWS /OUT:`"$helper`" /PDB:`"$obj64\$name-helper64.pdb`" /DEBUG")
+) -join " && "
+cmd /c $cmd
+if ($LASTEXITCODE) { throw "helper build failed" }
+Write-Host "Built $helper"
+
 if ($Install) {
     if (-not (Test-Path "$GameDir\$exe")) { throw "$exe not found in $GameDir (pass -GameDir)" }
     if (Get-Process ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue) { throw "Close the game first." }
-    Copy-Item $addon $GameDir -Force
+    Copy-Item $addon, $helper $GameDir -Force
     Write-Host "Installed to $GameDir"
 }

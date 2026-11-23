@@ -69,3 +69,15 @@ Snapshots from the moving capture (every 4th pixel, tools/rt2png.py; ids differ 
 Colour (#52c30 path, rgba16f), depth (packed RGB, decode), motion (camera, from depth + VP
 history), jitter (VS c1..c4 hook), DLSS in a 64-bit helper via D3D9Ex shared textures.
 In-game AA should be off (FXAA runs after the tonemap). Next: helper proof of concept.
+
+## 0.0.3: helper round trip (proof of concept, 2026-11-23)
+
+- RE6DLSS-helper64.exe (64-bit, D3D11) started by the add-on; control block in a named file
+  mapping + go/done events (src/shared.h). D3D9Ex legacy shared handles (A16B16G16R16F, format
+  113) open in D3D11 as R16G16B16A16_FLOAT (10).
+- At the tonemap draw (ps1009a8dd t0 = HDR scene): StretchRect scene -> shared in, D3D9 event
+  query wait, signal helper, helper copies/inverts into shared out and waits for its GPU work,
+  signals back, StretchRect out -> scene. Once per frame.
+- Title screen: **1.45 ms per frame** (helper part 0.28 ms; first frame 3.35 ms). The helper's
+  D3D11 device takes ~0.3-0.7 s to start: frames are skipped until it reports alive (the first
+  try with a 200 ms first-frame timeout failed). Helper exits when the game exits.

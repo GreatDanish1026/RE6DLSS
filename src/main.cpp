@@ -41,6 +41,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "shared.h"
 #include "version.h"
 
 extern "C" __declspec(dllexport) const char* NAME = RD_PRODUCT;
@@ -472,6 +473,8 @@ Stage* StageOf(Context& c, shader_stage s) {
     return nullptr;
 }
 
+#include "roundtrip.inl"
+
 void OnInitDevice(device* dev) {
     if (dev->get_api() != device_api::d3d9) {
         Log("device: API %u", static_cast<unsigned>(dev->get_api()));
@@ -481,7 +484,10 @@ void OnInitDevice(device* dev) {
     IDirect3DDevice9Ex* ex = nullptr;
     const HRESULT hr = d9 ? d9->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&ex)) : E_POINTER;
     Log("device: D3D9 %p, IDirect3DDevice9Ex: %s (hr 0x%08lx)", d9, SUCCEEDED(hr) && ex ? "yes" : "no", hr);
-    if (ex) ex->Release();
+    if (ex) {
+        g_d9 = ex;  // kept for the device's lifetime (round trip)
+        ex->Release();
+    }
 }
 
 void OnInitCommandList(command_list* cl) {
@@ -579,8 +585,8 @@ void AddLocked(Context& c, std::string line) {
 
 // Render target snapshots (first captured frame only): when the game switches away from a render
 // target of back-buffer size, a copy of it is read back and saved every 4th pixel to
-// RE6DLSS-rt-NN-<id>.bin (header: "RT4 ", width, height, format, step; then rows of pixels).
-// toolst2png.py turns them into PNGs.
+// RE6DLSS-rt-NN-<id>.bin (header: 'RT4' + NUL, width, height, format, step; then rows of
+// pixels). tools/rt2png.py turns them into PNGs.
 int g_snapshots = 0;
 uint32_t g_bbWidth = 0, g_bbHeight = 0;
 bool g_snapFrame = false;
@@ -770,6 +776,7 @@ void Other(command_list* cl) {
 }
 
 bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
+    MaybeRoundTrip(cl);
     if (!Recording()) return false;
     if (vertices <= 4 && instances == 1) Pass(cl, false, Format("draw %u verts", vertices));
     else Other(cl);
@@ -904,6 +911,7 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
         return;
     }
     ++g_presents;
+    g_rtDoneThisFrame = false;
     if (!g_immediate) {
         g_immediate = q->get_native();
         const resource_desc d = sc->get_device()->get_resource_desc(sc->get_current_back_buffer());
@@ -950,6 +958,14 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
 
 void DrawOverlay(effect_runtime*) {
     ImGui::TextUnformatted(RD_PRODUCT " " RD_VERSION ": probe build (no DLSS yet)");
+    {
+        static const char* const kModes[] = {"Off", "Copy (should look unchanged)", "Invert (should look inverted)"};
+        if (ImGui::Combo("Helper round trip", &g_rtMode, kModes, 3)) {
+            g_rtFailed = false;
+            reshade::set_config_value(nullptr, RD_PRODUCT, "RoundTrip", g_rtMode);
+        }
+        ImGui::TextDisabled("%s", g_rtMode ? g_rtStatus.c_str() : "off");
+    }
     ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
     if (ImGui::Button(g_captureHotkey ? "Capture frame (F10)" : "Capture frame")) StartCapture();
     ImGui::EndDisabled();
@@ -980,6 +996,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             g_veh = AddVectoredExceptionHandler(1, &OnException);
             LoadDumpList();
             reshade::get_config_value(nullptr, RD_PRODUCT, "CaptureHotkey", g_captureHotkey);
+            reshade::get_config_value(nullptr, RD_PRODUCT, "RoundTrip", g_rtMode);
             reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
             reshade::register_event<reshade::addon_event::init_resource>(&OnInitResource);
             reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
@@ -1011,6 +1028,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::register_overlay(RD_PRODUCT, &DrawOverlay);
             break;
         case DLL_PROCESS_DETACH:
+            StopHelper();
             if (g_veh) RemoveVectoredExceptionHandler(g_veh);
             reshade::unregister_addon(module);
             if (g_log) fclose(g_log);
