@@ -43,3 +43,29 @@ Capture: F10 ([RE6DLSS] CaptureHotkey=1) or the overlay button -> RE6DLSS-frame-
 - Constants: push_constants VS = layout param 2, PS = param 5; first/count in floats (first 4 =
   c1). 0.0.1 ignored them (expected param 0), hence all-zero dumps.
 - Render target snapshots on capture (RE6DLSS-rt-*.bin, every 4th pixel) + tools/rt2png.py.
+
+## Captures 2-3 with snapshots (0.0.2, still + moving, 2026-11-23)
+
+Snapshots from the moving capture (every 4th pixel, tools/rt2png.py; ids differ per run):
+- **Depth is packed into colour**: the pre-pass target (#2965e this run) holds a 24-bit depth
+  split over R (high byte, 0.79..1), G and B (8 bits each) -> depth = R + G/255 + B/65025
+  (to be confirmed: NDC z or linear). It's readable, unlike the d24s8 depth-stencil.
+- #296a8: normals G-buffer. #2972a: blue-only mask (one character + floor).
+- #29774 / #29718: scene colour before / after fog and light shafts; #29718 feeds the tonemap.
+- **No velocity buffer**: no target holds motion; the 97 draws after the scene don't change the
+  depth target (snapshots 1, 6, 8 identical). RE6's motion blur must be camera-only. DLAA's motion
+  vectors: camera motion from depth + current/previous view-projection (static scene correct;
+  characters' own motion missing -> possible ghosting, revisit later).
+- **Camera view-projection = VS c1..c4** in every scene draw, row-vector layout (translation in
+  c4; z and w columns nearly equal), e.g. c1 (1.244 0.297 0.444 0.444), c2 (0 2.406 -0.259 -0.259),
+  c3 (0.644 -0.573 -0.858 -0.858), c4 (95.4 205.0 233.2 249.2). c5..c7 = object world matrix.
+  c6/c8 = (1/3840, 1/2160): D3D9 half-pixel offset.
+- **Jitter plan**: hook IDirect3DDevice9::SetVertexShaderConstantF (ReShade's push_constants event
+  is read-only) and, while a back-buffer-sized target is bound, add jitter to c1..c4's x and y
+  columns (col_x += jx * col_w). Keep each frame's unjittered matrix for motion vectors.
+
+## Feasibility (all inputs available)
+
+Colour (#52c30 path, rgba16f), depth (packed RGB, decode), motion (camera, from depth + VP
+history), jitter (VS c1..c4 hook), DLSS in a 64-bit helper via D3D9Ex shared textures.
+In-game AA should be off (FXAA runs after the tonemap). Next: helper proof of concept.
