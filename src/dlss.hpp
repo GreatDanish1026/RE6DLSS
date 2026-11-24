@@ -29,6 +29,7 @@ struct Inputs {
     int preset = 0;                      // NVSDK_NGX_DLSS_Hint_Render_Preset_*, or kPresetAuto
     bool mvJittered = false;             // the motion vectors include the jitter
     bool depthInverted = true;           // 1 = near, 0 = far (RE6: false)
+    bool hdr = true;                     // colour is linear HDR (float); false: 8-bit display-referred
 };
 
 // Loads NGX for the device (once). False with a reason if DLSS can't run.

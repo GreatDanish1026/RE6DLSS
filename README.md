@@ -13,9 +13,12 @@ back before the game's tonemapping, so bloom, HDR (RenoDX), post effects and the
 
 - An **NVIDIA RTX** graphics card and a current driver.
 - **ReShade 6.8 or later, 32-bit, with add-on support**, installed as `d3d9.dll` next to `BH6.exe`.
-- **RenoDX for Resident Evil 6** (`renodx-residentevil6.addon32`). Besides HDR, it upgrades the
-  game's Direct3D 9 device to Direct3D 9Ex, which is what lets the game share images with the
-  helper. Without it the add-on says so in the overlay and stays off.
+- Optional: **RenoDX for Resident Evil 6** (`renodx-residentevil6.addon32`) for HDR. DLAA works
+  with or without it. Sharing images with the helper needs a Direct3D 9Ex device: RenoDX upgrades
+  the game's device to 9Ex, and without RenoDX the add-on asks ReShade for the upgrade itself. A
+  9Ex device can't use exclusive fullscreen the way the game asks for it, so the game then runs
+  borderless windowed at the same resolution (as it does with RenoDX). `UpgradeDevice=0` in
+  `[RE6DLSS]` turns the upgrade off (DLAA then stays off without RenoDX).
 - Recommended: **RE6Tweaks** (fixes the startup crashes on displays with many display modes).
 
 ## Install
@@ -76,7 +79,8 @@ ReShade overlay (Home key), Add-ons tab, **RE6DLSS**; saved in `ReShade.ini` und
   whatever the DLSS model setting says.
 - Logs: `RE6DLSS.log` (add-on) and `RE6DLSS-helper64.log` (helper, including NVIDIA's NGX messages)
   next to `BH6.exe`.
-- Tested with Leon's campaign at 3840x2160 with RenoDX HDR on an RTX 5080.
+- Tested with Leon's campaign at 3840x2160 on an RTX 5080, with RenoDX HDR and without RenoDX.
+  Without RenoDX the scene is 8-bit, and DLSS is set up for 8-bit colour.
 
 ## Changes
 

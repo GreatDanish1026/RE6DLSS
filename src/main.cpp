@@ -483,6 +483,67 @@ Stage* StageOf(Context& c, shader_stage s) {
 #include "roundtrip.inl"
 #include "objects.inl"
 
+// ---- Direct3D 9Ex without RenoDX
+//
+// The hand-off to the helper needs shared textures, which only a Direct3D 9Ex device can create.
+// RenoDX upgrades the game's device to 9Ex; without it, the add-on asks ReShade for the upgrade
+// itself (create_device: API version 0x9100 = IDirect3D9Ex::CreateDeviceEx). Setting
+// UpgradeDevice=0 in [RE6DLSS] leaves the device as the game creates it.
+bool g_upgradeDevice = true;
+bool g_upgradedByUs = false;
+
+bool OnCreateDevice(device_api api, uint32_t& version) {
+    if (api != device_api::d3d9) return false;
+    Log("create_device: D3D9, API version 0x%x%s", version, version >= 0x9100 ? " (9Ex already)" : "");
+    if (!g_upgradeDevice || version >= 0x9100) return false;
+    version = 0x9100;
+    g_upgradedByUs = true;
+    Log("create_device: asking for Direct3D 9Ex (needed for the hand-off to the helper)");
+    return true;
+}
+
+// A 9Ex device in exclusive fullscreen needs the display mode spelled out (CreateDeviceEx fails
+// with D3DERR_INVALIDCALL otherwise), so the game runs borderless windowed at the same size, as
+// it does with RenoDX (SwapChainForceBorderless).
+bool OnCreateSwapchain(device_api api, swapchain_desc& desc, void* hwnd) {
+    if (api != device_api::d3d9 || !g_upgradeDevice || !desc.fullscreen_state) return false;
+    desc.fullscreen_state = false;
+    desc.fullscreen_refresh_rate = 0;
+    Log("create_swapchain: exclusive fullscreen -> borderless windowed %ux%u (for Direct3D 9Ex)", desc.back_buffer.texture.width,
+        desc.back_buffer.texture.height);
+    if (hwnd) {  // a fullscreen-sized window without borders on the game's monitor
+        HWND w = static_cast<HWND>(hwnd);
+        MONITORINFO mi = {sizeof(mi)};
+        GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTOPRIMARY), &mi);
+        SetWindowLongW(w, GWL_STYLE, (GetWindowLongW(w, GWL_STYLE) & ~WS_OVERLAPPEDWINDOW) | WS_POPUP | WS_VISIBLE);
+        SetWindowPos(w, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOACTIVATE);
+    }
+    return true;
+}
+
+// Probe: which memory pools the game's resources use (9Ex has no managed pool).
+std::mutex g_heapMutex;
+std::map<std::pair<int, int>, uint32_t> g_heapCounts;  // (resource type, heap) -> count
+std::atomic<uint32_t> g_resCreated{0};
+
+bool OnCreateResourceProbe(device* dev, resource_desc& desc, subresource_data*, resource_usage) {
+    if (dev->get_api() != device_api::d3d9) return false;
+    ++g_resCreated;
+    std::lock_guard<std::mutex> lock(g_heapMutex);
+    ++g_heapCounts[{static_cast<int>(desc.type), static_cast<int>(desc.heap)}];
+    return false;
+}
+
+void LogHeapCounts(const char* when) {
+    std::lock_guard<std::mutex> lock(g_heapMutex);
+    std::string s;
+    static const char* const kType[] = {"unknown", "buffer", "texture1d", "texture2d", "texture3d", "surface"};
+    for (const auto& e : g_heapCounts)
+        s += Format(" %s/heap%d x%u", e.first.first >= 0 && e.first.first < 6 ? kType[e.first.first] : "?", e.first.second, e.second);
+    Log("resources %s: %u created;%s", when, g_resCreated.load(), s.c_str());
+}
+
 void OnInitDevice(device* dev) {
     if (dev->get_api() != device_api::d3d9) {
         Log("device: API %u", static_cast<unsigned>(dev->get_api()));
@@ -930,6 +991,7 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
         return;
     }
     ++g_presents;
+    if (g_presents == 1 || g_presents % 3000 == 0) LogHeapCounts(g_presents == 1 ? "at the first frame" : "so far");
     g_rtDoneThisFrame = false;
     g_depthRes = {0};
     ObjectsFrameEnd();
@@ -1000,6 +1062,7 @@ void ApplySettings() {
 void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "CaptureHotkey", g_captureHotkey);
     reshade::get_config_value(nullptr, RD_PRODUCT, "Developer", g_developer);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "UpgradeDevice", g_upgradeDevice);
     reshade::get_config_value(nullptr, RD_PRODUCT, "AntiAliasing", g_aa);
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssModel", g_model);
     reshade::get_config_value(nullptr, RD_PRODUCT, "ObjectMotion", g_objMotionOn);
@@ -1041,7 +1104,7 @@ void DrawOverlay(effect_runtime*) {
     static const char* const kAa[] = {"Off", "DLAA"};
     if (ImGui::Combo("Anti-aliasing", &g_aa, kAa, 2)) SaveSettings();
     Help("DLAA: NVIDIA DLSS at native resolution, in place of the game's anti-aliasing (set the game's "
-         "anti-aliasing to Off). Needs an NVIDIA RTX GPU and RenoDX. Runs on the GPU alongside the game "
+         "anti-aliasing to Off). Needs an NVIDIA RTX GPU; works with or without RenoDX. Runs on the GPU alongside the game "
          "(about 2.5 ms of GPU time per frame at 4K).");
     ImGui::BeginDisabled(!g_aa);
     if (ImGui::Combo("DLSS model", &g_model, kModels, 5)) SaveSettings();
@@ -1062,7 +1125,8 @@ void DrawOverlay(effect_runtime*) {
 
     const ImVec4 warn(1.0f, 0.75f, 0.3f, 1.0f);
     if (g_noEx)
-        ImGui::TextColored(warn, "The game's device isn't D3D9Ex: install RenoDX for Resident Evil 6 (DLAA needs it).");
+        ImGui::TextColored(warn, "The game's device isn't Direct3D 9Ex, which DLAA needs: set UpgradeDevice=1 in [RE6DLSS] "
+                                 "(the default) or install RenoDX, then restart the game.");
     else if (!g_d9)
         ImGui::TextDisabled("Waiting for the game's device...");
     else if (g_rtMode)
@@ -1104,6 +1168,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             g_veh = AddVectoredExceptionHandler(1, &OnException);
             LoadDumpList();
             LoadSettings();
+            reshade::register_event<reshade::addon_event::create_device>(&OnCreateDevice);
+            reshade::register_event<reshade::addon_event::create_swapchain>(&OnCreateSwapchain);
+            reshade::register_event<reshade::addon_event::create_resource>(&OnCreateResourceProbe);
             reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
             reshade::register_event<reshade::addon_event::init_resource>(&OnInitResource);
             reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);

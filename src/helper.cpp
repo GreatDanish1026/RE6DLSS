@@ -359,6 +359,12 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
     in.reset = ctl->reset != 0 || !ctl->havePrev;
     in.preset = ctl->preset;
     in.depthInverted = false;
+    {  // RenoDX: 16-bit float scene (linear HDR); without it the game's own 8-bit scene
+        D3D11_TEXTURE2D_DESC cd;
+        g.in->GetDesc(&cd);
+        in.hdr = cd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || cd.Format == DXGI_FORMAT_R32G32B32A32_FLOAT ||
+                 cd.Format == DXGI_FORMAT_R11G11B10_FLOAT;
+    }
     in.biasMask = masked ? g.maskTex : nullptr;
     std::string err;
     if (!dlss::Evaluate(g.ctx, in, err)) {

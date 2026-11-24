@@ -34,6 +34,7 @@ struct Feature {
     unsigned renderW = 0, renderH = 0, outW = 0, outH = 0;
     int preset = -1;
     bool autoExposure = true;
+    bool hdr = true;
     bool mvJittered = false;
 } g_feature;
 
@@ -107,7 +108,7 @@ bool CreateFeature(ID3D11DeviceContext* context, const Inputs& in, std::string& 
     cp.Feature.InTargetWidth = in.outputWidth;
     cp.Feature.InTargetHeight = in.outputHeight;
     cp.Feature.InPerfQualityValue = q;
-    cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+    cp.InFeatureCreateFlags = (in.hdr ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0) | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                               (in.depthInverted ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0) |
                               (in.exposure ? 0 : NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) |
                               (in.mvJittered ? NVSDK_NGX_DLSS_Feature_Flags_MVJittered : 0);
@@ -120,9 +121,9 @@ bool CreateFeature(ID3D11DeviceContext* context, const Inputs& in, std::string& 
     g_feature.mvJittered = in.mvJittered;
     g_feature.renderW = in.renderWidth, g_feature.renderH = in.renderHeight;
     g_feature.outW = in.outputWidth, g_feature.outH = in.outputHeight;
-    g_feature.preset = in.preset, g_feature.autoExposure = !in.exposure;
-    rd::Log("DLSS feature created: %ux%u -> %ux%u, %s mode, preset %d, %s exposure", in.renderWidth, in.renderHeight,
-            in.outputWidth, in.outputHeight, QualityName(q), in.preset, in.exposure ? "game" : "auto");
+    g_feature.preset = in.preset, g_feature.autoExposure = !in.exposure, g_feature.hdr = in.hdr;
+    rd::Log("DLSS feature created: %ux%u -> %ux%u, %s mode, preset %d, %s exposure, %s colour", in.renderWidth, in.renderHeight,
+            in.outputWidth, in.outputHeight, QualityName(q), in.preset, in.exposure ? "game" : "auto", in.hdr ? "HDR" : "8-bit");
     return true;
 }
 
@@ -216,7 +217,7 @@ bool Evaluate(ID3D11DeviceContext* context, const Inputs& requested, std::string
     const bool fresh = !g_feature.handle || in.renderWidth != g_feature.renderW || in.renderHeight != g_feature.renderH ||
                        in.outputWidth != g_feature.outW || in.outputHeight != g_feature.outH ||
                        in.preset != g_feature.preset || g_feature.autoExposure != !in.exposure ||
-                       g_feature.mvJittered != in.mvJittered;
+                       g_feature.mvJittered != in.mvJittered || g_feature.hdr != in.hdr;
     if (fresh && !CreateFeature(context, in, error)) ok = false;
     if (ok) {
         NVSDK_NGX_D3D11_DLSS_Eval_Params ep = {};
