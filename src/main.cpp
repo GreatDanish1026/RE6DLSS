@@ -1016,13 +1016,13 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssModel", g_model);
     reshade::get_config_value(nullptr, RD_PRODUCT, "ObjectMotion", g_objMotionOn);
     reshade::get_config_value(nullptr, RD_PRODUCT, "EffectMask", g_effectMaskOn);
-    reshade::get_config_value(nullptr, RD_PRODUCT, "LowLatency", g_asyncOn);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Pipelined", g_pipelineOn);
     if (g_aa < 0 || g_aa > 1) g_aa = 1;
     if (g_model < 0 || g_model > 4) g_model = 0;
     ApplySettings();
-    Log("settings: anti-aliasing %s, DLSS model %s, character motion %s, effect mask %s, low-latency hand-off %s",
+    Log("settings: anti-aliasing %s, DLSS model %s, character motion %s, effect mask %s, pipelined %s",
         g_aa ? "DLAA" : "off", kModels[g_model], g_objMotionOn ? "on" : "off", g_effectMaskOn ? "on" : "off",
-        g_asyncOn ? "on" : "off");
+        g_pipelineOn ? "on" : "off");
 }
 
 void SaveSettings() {
@@ -1030,7 +1030,7 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "DlssModel", g_model);
     reshade::set_config_value(nullptr, RD_PRODUCT, "ObjectMotion", g_objMotionOn);
     reshade::set_config_value(nullptr, RD_PRODUCT, "EffectMask", g_effectMaskOn);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "LowLatency", g_asyncOn);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "Pipelined", g_pipelineOn);
     ApplySettings();
 }
 
@@ -1064,12 +1064,10 @@ void DrawOverlay(effect_runtime*) {
     if (ImGui::Checkbox("Effect mask", &g_effectMaskOn)) SaveSettings();
     Help("Tells DLAA not to carry fire, smoke, sparks and other see-through effects over from earlier frames, "
          "so they don't smear.");
-    if (ImGui::Checkbox("Low-latency hand-off", &g_asyncOn)) SaveSettings();
-    Help("The game doesn't wait for the GPU while DLAA runs, so the CPU and GPU stay busy (higher frame rate). "
-         "Relies on Windows keeping the two processes' GPU work in order; checked once a second, and switched "
-         "off by itself if that ever fails.");
-    if (g_asyncBroken)
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Low-latency hand-off switched off: the order check failed on this system.");
+    if (ImGui::Checkbox("Pipelined (higher frame rate)", &g_pipelineOn)) SaveSettings();
+    Help("The game doesn't wait for DLAA: each frame shows the previous frame's DLAA image, so the CPU and GPU "
+         "stay busy. The 3D image is one frame behind the HUD (about 7 ms at 150 fps). Off: every frame waits "
+         "for DLAA (about 2.5-3.5 ms per frame), no delay.");
     ImGui::EndDisabled();
 
     const ImVec4 warn(1.0f, 0.75f, 0.3f, 1.0f);
@@ -1088,7 +1086,6 @@ void DrawOverlay(effect_runtime*) {
     if (ImGui::Checkbox("Jitter test (16x, the picture shakes)", &g_jitterTest)) ApplySettings();
     static const char* const kViews[] = {"Off (normal)", "Motion vectors", "Effect mask"};
     ImGui::Combo("Debug view", &g_debugView, kViews, 3);
-    ImGui::TextDisabled("low-latency order checks: %u passed, %u failed", g_asyncOk, g_asyncStale);
     ImGui::TextDisabled("objects last frame: %u motion draws, %u mask draws; vertex shaders patched %u, failed %u; %s",
                         g_objStatsLast.motionDraws, g_objStatsLast.maskDraws, g_objStatsLast.patched,
                         g_objStatsLast.failedPatch, g_objStatus.c_str());

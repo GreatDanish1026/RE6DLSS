@@ -261,7 +261,17 @@ std::string g_objStatus = "not started";
 
 struct ObjStats {
     uint32_t motionDraws = 0, maskDraws = 0, skipped = 0, failedPatch = 0, patched = 0;
+    double cpuMs = 0;  // time spent in OnSceneDraw (replays included) this frame
 } g_objStats, g_objStatsLast;
+struct TargetStats {
+    uint32_t order = 0, draws = 0, skinned = 0, rigid = 0, motion = 0, mask = 0;
+    bool depth = false;
+};
+std::map<uintptr_t, TargetStats> g_targetStats;  // per render target 0 texture, this frame
+uint32_t g_targetOrder = 0;
+// The scene has two colour passes that both draw every character (lighting and colour); motion
+// is replayed in the first one only (the first non-pre-pass target with a moving draw this frame).
+uintptr_t g_motionTarget = 0;
 uint32_t g_patchFailLogs = 0;
 
 using D3DCompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT,
@@ -500,8 +510,22 @@ void ReplayMask(IDirect3DDevice9* dev, const DrawArgs& d) {
     targets.Restore(dev);
 }
 
+void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, TargetStats*& ts);
+
 void OnSceneDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib) {
     if (g_pastTonemap || !g_bbWidth || !ObjectsActive()) return;
+    LARGE_INTEGER t0, t1, f;
+    QueryPerformanceCounter(&t0);
+    const uint32_t motion0 = g_objStats.motionDraws, mask0 = g_objStats.maskDraws;
+    TargetStats* ts = nullptr;
+    OnSceneDrawImpl(dev, d, ib, ts);
+    if (ts) ts->motion += g_objStats.motionDraws - motion0, ts->mask += g_objStats.maskDraws - mask0;
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    g_objStats.cpuMs += (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+}
+
+void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, TargetStats*& ts) {
     IDirect3DSurface9* rt = nullptr;
     if (FAILED(dev->GetRenderTarget(0, &rt)) || !rt) return;
     D3DSURFACE_DESC rd = {};
@@ -511,7 +535,14 @@ void OnSceneDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib) {
     rt->Release();
     if (rtTex) rtTex->Release();  // only compared
     if (rd.Width != g_bbWidth || rd.Height != g_bbHeight) return;
-    if (g_depthRes.handle && rtTex == reinterpret_cast<IDirect3DTexture9*>(g_depthRes.handle)) return;  // depth pre-pass
+    {
+        auto ins = g_targetStats.try_emplace(reinterpret_cast<uintptr_t>(rtTex));
+        ts = &ins.first->second;
+        if (ins.second) ts->order = g_targetOrder++;
+        ++ts->draws;
+        ts->depth = g_depthRes.handle && rtTex == reinterpret_cast<IDirect3DTexture9*>(g_depthRes.handle);
+    }
+    if (ts->depth) return;  // depth pre-pass
     IDirect3DVertexShader9* vs = nullptr;
     if (FAILED(dev->GetVertexShader(&vs)) || !vs) return;
     ObjVs& o = ObjVsInfo(vs);
@@ -525,7 +556,12 @@ void OnSceneDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib) {
         if (g_effectMaskOn) ReplayMask(dev, d);
         return;
     }
+    if (o.boneSampler >= 0) ++ts->skinned;
+    else if (o.worldReg >= 0) ++ts->rigid;
     if (!g_objMotionOn || !zwrite || (o.worldReg < 0 && o.boneSampler < 0)) return;
+    const uintptr_t target = reinterpret_cast<uintptr_t>(rtTex);
+    if (!g_motionTarget) g_motionTarget = target;
+    if (target != g_motionTarget) return;
     // History of this draw (keyed by its geometry and how often it was drawn so far this frame).
     IDirect3DVertexBuffer9* vbp = nullptr;
     UINT off = 0, stride = 0;
@@ -567,6 +603,7 @@ HRESULT STDMETHODCALLTYPE HookDip(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, 
                                   UINT prims) {
     if (g_inDrawHook) return g_dipFirst(dev, type, base, minV, numV, start, prims);  // another hook chained back to us
     g_inDrawHook = true;
+    PollPipeline();
     IDirect3DIndexBuffer9* ib = nullptr;
     if (SUCCEEDED(dev->GetIndices(&ib)) && ib) ib->Release();
     OnSceneDraw(dev, DrawArgs{true, type, base, minV, numV, start, prims}, reinterpret_cast<uintptr_t>(ib));
@@ -578,6 +615,7 @@ HRESULT STDMETHODCALLTYPE HookDip(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, 
 HRESULT STDMETHODCALLTYPE HookDp(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, UINT start, UINT prims) {
     if (g_inDrawHook) return g_dpFirst(dev, type, start, prims);
     g_inDrawHook = true;
+    PollPipeline();
     OnSceneDraw(dev, DrawArgs{false, type, 0, 0, 0, start, prims}, 0);
     const HRESULT hr = g_dp(dev, type, start, prims);
     g_inDrawHook = false;
@@ -689,6 +727,7 @@ void CopyBones() {
 
 void ObjectsFrameEnd() {  // at present (after this frame's round trip)
     if (g_d9) HookDraws(g_d9);
+    PollPipeline();
     if (ObjectsActive()) {
         CopyBones();
         g_d9->ColorFill(g_objSurf, nullptr, 0);  // next frame starts with no object motion, no mask
@@ -700,9 +739,22 @@ void ObjectsFrameEnd() {  // at present (after this frame's round trip)
     g_histCur.clear();
     g_occurrence.clear();
     g_objStatsLast = g_objStats;
-    if (g_jitterIndex % 1200 == 900)
-        Log("objects: last frame %u motion draws, %u mask draws, %u without history; shaders patched %u, failed %u",
-            g_objStats.motionDraws, g_objStats.maskDraws, g_objStats.skipped, g_objStats.patched, g_objStats.failedPatch);
+    if (g_jitterIndex % 600 == 300 && g_objStats.motionDraws + g_objStats.maskDraws > 0) {
+        Log("objects: last frame %u motion draws, %u mask draws, %u without history, %.2f ms CPU; shaders patched %u, failed %u",
+            g_objStats.motionDraws, g_objStats.maskDraws, g_objStats.skipped, g_objStats.cpuMs, g_objStats.patched,
+            g_objStats.failedPatch);
+        std::vector<std::pair<uint32_t, std::pair<uintptr_t, TargetStats>>> v;
+        for (const auto& e : g_targetStats) v.push_back({e.second.order, e});
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& e : v)
+            Log("  target %u (%p)%s: %u draws (%u skinned, %u rigid), %u motion replays, %u mask replays", e.first,
+                reinterpret_cast<void*>(e.second.first), e.second.second.depth ? " depth pre-pass" : "", e.second.second.draws,
+                e.second.second.skinned, e.second.second.rigid, e.second.second.motion, e.second.second.mask);
+    }
+    g_targetStats.clear();
+    g_targetOrder = 0;
+    g_motionTarget = 0;
     g_objStats.motionDraws = g_objStats.maskDraws = g_objStats.skipped = 0;
+    g_objStats.cpuMs = 0;
     g_objWritten = g_maskWritten = false;
 }

@@ -1,12 +1,22 @@
-// ---------------------------------------------------------------- helper round trip (proof of concept)
+// ---------------------------------------------------------------- helper round trip
 //
 // Included into main.cpp's anonymous namespace. At the game's tonemap draw (ps1009a8dd, which reads
-// the HDR scene at t0) the scene is copied into a D3D9Ex shared texture, the GPU work is waited
-// for, RE6DLSS-helper64.exe is signalled, and once it signals back its output texture is copied over
-// the scene before the tonemap draw runs. Once per frame. Mode: Off / Copy / Invert / DLAA
-// (ReShade.ini [RE6DLSS] RoundTrip=0/1/2/3). For DLAA the game's packed depth (the first
-// back-buffer-sized target of the frame, its pre-pass) is shared too, with this frame's jitter and
-// the current and previous view-projection.
+// the HDR scene at t0) the scene, the game's packed depth (the first back-buffer-sized target of the
+// frame, its pre-pass) and the object texture (objects.inl) are copied into D3D9Ex shared textures
+// for RE6DLSS-helper64.exe, with this frame's jitter and the current and previous view-projection.
+// Mode: Off / Copy / Invert / DLAA.
+//
+// Two hand-offs (setting Pipelined):
+// - Waiting: the GPU work is waited for, the helper is signalled, and once it signals back its
+//   output is copied over the scene before the tonemap draw runs. The game's render thread and
+//   the GPU both stand still for ~2.5-3.5 ms every frame.
+// - Pipelined: nothing waits. The copies are queued with an event query behind them; draws later
+//   in the frame (and present) check the query without waiting and signal the helper as soon as
+//   the copies are done on the GPU. At the next frame's tonemap the helper's output (finished by
+//   then) goes over the scene: the 3D image is one frame behind the HUD and post-processing.
+//   Each process only touches a shared texture after the other's work on it is known to be finished
+//   (the helper answers once its GPU work is done; it starts only after the query), because this
+//   system doesn't keep the GPU order between the two processes by itself (checked).
 
 constexpr uint32_t kTonemapPs = 0x1009a8dd;
 constexpr DWORD kHelperTimeoutMs = 200;
@@ -23,14 +33,12 @@ PROCESS_INFORMATION g_helper = {};
 IDirect3DTexture9* g_inTex = nullptr;
 IDirect3DTexture9* g_outTex = nullptr;
 IDirect3DTexture9* g_depthTex = nullptr;
-IDirect3DTexture9* g_objTex = nullptr;   // moving objects' motion + effect mask (objects.inl)
+IDirect3DTexture9* g_objShared = nullptr;  // copy of g_objTex for the helper
+IDirect3DTexture9* g_objTex = nullptr;     // moving objects' motion + effect mask, written during the scene (objects.inl)
 IDirect3DSurface9* g_objSurf = nullptr;
 bool g_objMotionOn = true, g_effectMaskOn = true;  // settings
+bool g_pipelineOn = true;                // setting: pipelined hand-off
 int g_debugView = 0;                     // developer: 1 motion vectors, 2 effect mask
-bool g_asyncOn = true;                   // setting: low-latency hand-off
-bool g_asyncBroken = false;              // the order check failed: back to waiting
-uint32_t g_asyncOk = 0, g_asyncStale = 0;
-IDirect3DSurface9 *g_checkRt = nullptr, *g_checkSys = nullptr;  // 1x1, for the order check
 D3DFORMAT g_depthFmt = D3DFMT_UNKNOWN;
 IDirect3DQuery9* g_query = nullptr;
 UINT g_texW = 0, g_texH = 0;
@@ -40,6 +48,21 @@ bool g_rtFailed = false;
 std::string g_rtStatus = "off";
 double g_rtMsAvg = 0, g_rtWaitAvg = 0;
 uint64_t g_rtFrames = 0;
+
+// Pipelined state.
+struct FrameParams {
+    uint32_t mode;
+    float jitterX, jitterY;
+    float viewProj[16], prevViewProj[16];
+    uint32_t havePrev, reset;
+    int32_t preset;
+    uint32_t objFlags, debugView;
+};
+FrameParams g_pend = {};
+bool g_queryPending = false;  // copies queued, helper not signalled yet
+bool g_inFlight = false;      // helper signalled, answer not collected yet
+bool g_haveResult = false;    // the output texture holds a finished frame not yet shown
+DWORD g_inFlightTimeout = kHelperTimeoutMs;
 
 uint32_t DxgiOf(D3DFORMAT f) {
     switch (f) {
@@ -96,14 +119,18 @@ bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt, D3DFORMAT depthFmt) {
     if (g_inTex) g_inTex->Release(), g_inTex = nullptr;
     if (g_outTex) g_outTex->Release(), g_outTex = nullptr;
     if (g_depthTex) g_depthTex->Release(), g_depthTex = nullptr;
+    if (g_objShared) g_objShared->Release(), g_objShared = nullptr;
     if (g_objSurf) g_objSurf->Release(), g_objSurf = nullptr;
     if (g_objTex) g_objTex->Release(), g_objTex = nullptr;
+    g_haveResult = false;
     HANDLE hin = nullptr, hout = nullptr, hdepth = nullptr, hobj = nullptr;
     HRESULT hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_inTex, &hin);
     if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_outTex, &hout);
     if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, depthFmt, D3DPOOL_DEFAULT, &g_depthTex, &hdepth);
     if (SUCCEEDED(hr))
-        hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_objTex, &hobj);
+        hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_objShared, &hobj);
+    if (SUCCEEDED(hr))
+        hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_objTex, nullptr);
     if (SUCCEEDED(hr)) hr = g_objTex->GetSurfaceLevel(0, &g_objSurf);
     if (SUCCEEDED(hr)) g_d9->ColorFill(g_objSurf, nullptr, 0);
     if (FAILED(hr) || !hin || !hout || !hdepth || !hobj) {
@@ -139,43 +166,88 @@ bool CameraCut(const float* cur, const float* prev) {
     return rot > 0.25f || trans > 0.25f * scale;
 }
 
-void Flush9() {  // submit the queued D3D9 work to the GPU without waiting for it
-    g_query->Issue(D3DISSUE_END);
-    g_query->GetData(nullptr, 0, D3DGETDATA_FLUSH);
-}
-
-float HalfToFloat(uint16_t h) {
-    const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
-    float v = e == 0 ? std::ldexp(static_cast<float>(m), -24) : e == 31 ? 65504.0f : std::ldexp(static_cast<float>(m | 0x400), static_cast<int>(e) - 25);
-    return s ? -v : v;
-}
-
-// Low-latency hand-off check: on some frames the input's top-left pixel carries a marker, the
-// helper copies it to the output, and once the output is back in the scene the marker is read
-// back (this one frame waits for the GPU). The right marker means the OS kept the GPU work of the
-// two processes in order; the previous output (stale) means it didn't, and the hand-off goes back
-// to waiting for the GPU.
-bool ReadMarker(IDirect3DSurface9* out, int& value) {
-    if (!g_checkRt && FAILED(g_d9->CreateRenderTarget(1, 1, D3DFMT_A16B16G16R16F, D3DMULTISAMPLE_NONE, 0, FALSE, &g_checkRt, nullptr)))
-        return false;
-    if (!g_checkSys && FAILED(g_d9->CreateOffscreenPlainSurface(1, 1, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM, &g_checkSys, nullptr)))
-        return false;
-    const RECT r = {0, 0, 1, 1};
-    if (FAILED(g_d9->StretchRect(out, &r, g_checkRt, nullptr, D3DTEXF_NONE))) return false;
-    if (FAILED(g_d9->GetRenderTargetData(g_checkRt, g_checkSys))) return false;
-    D3DLOCKED_RECT lr;
-    if (FAILED(g_checkSys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return false;
-    const uint16_t red = static_cast<const uint16_t*>(lr.pBits)[0];  // A16B16G16R16F: R first
-    g_checkSys->UnlockRect();
-    value = static_cast<int>(HalfToFloat(red) * 255.0f + 0.5f);
-    return true;
-}
-
 bool WaitGpu() {  // D3D9: event query, flushed, spun until the GPU is done (100 ms cap)
     g_query->Issue(D3DISSUE_END);
     const ULONGLONG until = GetTickCount64() + 100;
     while (g_query->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE)
         if (GetTickCount64() > until) return false;
+    return true;
+}
+
+// This frame's parameters for the helper (taken at the tonemap draw, sent now or later).
+FrameParams CaptureParams(bool depthOk) {
+    FrameParams p = {};
+    p.mode = g_rtMode == 3 ? (depthOk && g_haveFrameVp ? kModeDlaa : kModeCopy) : g_rtMode == 2 ? kModeInvert : kModeCopy;
+    p.jitterX = g_jitterX, p.jitterY = g_jitterY;
+    memcpy(p.viewProj, g_frameVp, sizeof(p.viewProj));
+    memcpy(p.prevViewProj, g_prevVp, sizeof(p.prevViewProj));
+    p.havePrev = g_havePrevVp ? 1 : 0;
+    const bool cut = g_havePrevVp && CameraCut(g_frameVp, g_prevVp);
+    if (cut) ++g_cuts;
+    p.reset = static_cast<int>(p.mode) != g_lastSentMode || cut ? 1 : 0;
+    p.preset = g_dlssPreset;
+    p.objFlags = (g_objMotionOn ? kObjMotion : 0u) | (g_effectMaskOn ? kObjMask : 0u);
+    p.debugView = static_cast<uint32_t>(g_debugView);
+    g_lastSentMode = static_cast<int>(p.mode);
+    return p;
+}
+
+void Signal(const FrameParams& p, DWORD timeout) {
+    g_ctl->mode = p.mode;
+    g_ctl->jitterX = p.jitterX, g_ctl->jitterY = p.jitterY;
+    memcpy(g_ctl->viewProj, p.viewProj, sizeof(p.viewProj));
+    memcpy(g_ctl->prevViewProj, p.prevViewProj, sizeof(p.prevViewProj));
+    g_ctl->havePrev = p.havePrev, g_ctl->reset = p.reset, g_ctl->preset = p.preset;
+    g_ctl->objFlags = p.objFlags, g_ctl->debugView = p.debugView;
+    g_ctl->async = 0, g_ctl->checkMarker = 0;
+    ResetEvent(g_done);  // a late answer to an earlier frame must not count for this one
+    SetEvent(g_go);
+    g_inFlight = true;
+    g_inFlightTimeout = timeout;
+}
+
+// Collect the helper's answer. False (and the round trip off) on a timeout or helper error.
+bool Collect() {
+    if (!g_inFlight) return true;
+    g_inFlight = false;
+    const DWORD w = WaitForSingleObject(g_done, g_inFlightTimeout);
+    if (w != WAIT_OBJECT_0) {
+        g_rtStatus = "helper didn't answer in time; round trip off";
+        Log("%s (helper status: %s)", g_rtStatus.c_str(), g_ctl->helperStatus);
+        g_rtFailed = true;
+        return false;
+    }
+    if (g_ctl->helperReady != g_ctl->generation) {
+        g_rtStatus = Format("helper error 0x%08lx: %s", static_cast<unsigned long>(g_ctl->helperError), g_ctl->helperStatus);
+        Log("%s", g_rtStatus.c_str());
+        g_rtFailed = true;
+        return false;
+    }
+    return true;
+}
+
+// Pipelined: called from the draw hooks and at present. Signals the helper once the queued copies
+// are finished on the GPU (no waiting: the query is only checked).
+void PollPipeline() {
+    if (!g_queryPending || !g_query) return;
+    if (g_query->GetData(nullptr, 0, 0) != S_OK) return;
+    g_queryPending = false;
+    Signal(g_pend, g_inFlightTimeout);
+}
+
+// Settle anything still in flight (mode switch, texture change, or the pipelined frame start).
+bool Drain() {
+    if (g_queryPending) {
+        g_queryPending = false;
+        const ULONGLONG until = GetTickCount64() + 100;
+        while (g_query->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE)
+            if (GetTickCount64() > until) break;
+        Signal(g_pend, g_inFlightTimeout);
+    }
+    if (g_inFlight) {
+        if (!Collect()) return false;
+        g_haveResult = true;
+    }
     return true;
 }
 
@@ -199,6 +271,12 @@ void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
         }
         return;
     }
+    // Last frame's work (pipelined): finished by now in the normal case, so no real wait.
+    QueryPerformanceCounter(&t1);
+    if (!Drain()) return;
+    QueryPerformanceCounter(&t2);
+    const double drainMs = static_cast<double>(t2.QuadPart - t1.QuadPart);
+
     const uint32_t generation = g_ctl->generation;
     D3DSURFACE_DESC dd = d;
     if (depth) depth->GetLevelDesc(0, &dd);
@@ -207,94 +285,57 @@ void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
         g_rtFailed = true;
         return;
     }
+    const bool pipelined = g_pipelineOn;
+    if (!pipelined) g_haveResult = false;
     // The first frame after (re)creating the textures includes the helper opening them.
     const DWORD timeout = g_ctl->generation != generation || g_ctl->helperReady != g_ctl->generation ? 2000 : kHelperTimeoutMs;
-    IDirect3DSurface9 *src = nullptr, *in = nullptr, *out = nullptr, *dsrc = nullptr, *dsh = nullptr;
+    IDirect3DSurface9 *src = nullptr, *in = nullptr, *out = nullptr, *dsrc = nullptr, *dsh = nullptr, *osh = nullptr;
     scene->GetSurfaceLevel(0, &src);
     g_inTex->GetSurfaceLevel(0, &in);
     g_outTex->GetSurfaceLevel(0, &out);
     if (depth) depth->GetSurfaceLevel(0, &dsrc);
     g_depthTex->GetSurfaceLevel(0, &dsh);
+    g_objShared->GetSurfaceLevel(0, &osh);
     const bool depthOk = dsrc && dsh && SUCCEEDED(g_d9->StretchRect(dsrc, nullptr, dsh, nullptr, D3DTEXF_NONE));
-    const bool async = g_asyncOn && !g_asyncBroken;
-    const bool check = async && g_rtFrames % 60 == 30;
-    const int marker = 1 + static_cast<int>((g_rtFrames / 60) % 250);
-    bool copied = src && in && out && SUCCEEDED(g_d9->StretchRect(src, nullptr, in, nullptr, D3DTEXF_NONE));
-    if (copied && check) {
-        const RECT r = {0, 0, 1, 1};
-        g_d9->ColorFill(in, &r, D3DCOLOR_ARGB(255, marker, 0, 0));
-    }
-    if (copied) {
-        if (async) Flush9();
-        else copied = WaitGpu();
-    }
-    if (copied) {
-        g_ctl->async = async ? 1 : 0;
-        g_ctl->checkMarker = check ? static_cast<uint32_t>(marker) : 0;
-        g_ctl->mode = g_rtMode == 3 ? (depthOk && g_haveFrameVp ? kModeDlaa : kModeCopy)
-                                    : g_rtMode == 2 ? kModeInvert : kModeCopy;
-        g_ctl->jitterX = g_jitterX;
-        g_ctl->jitterY = g_jitterY;
-        memcpy(g_ctl->viewProj, g_frameVp, sizeof(g_ctl->viewProj));
-        memcpy(g_ctl->prevViewProj, g_prevVp, sizeof(g_ctl->prevViewProj));
-        g_ctl->havePrev = g_havePrevVp ? 1 : 0;
-        const bool cut = g_havePrevVp && CameraCut(g_frameVp, g_prevVp);
-        if (cut) ++g_cuts;
-        g_ctl->reset = static_cast<int>(g_ctl->mode) != g_lastSentMode || cut ? 1 : 0;
-        g_ctl->preset = g_dlssPreset;
-        g_ctl->objFlags = (g_objMotionOn ? kObjMotion : 0u) | (g_effectMaskOn ? kObjMask : 0u);
-        g_ctl->debugView = static_cast<uint32_t>(g_debugView);
-        g_lastSentMode = static_cast<int>(g_ctl->mode);
-        QueryPerformanceCounter(&t1);
-        ResetEvent(g_done);  // a late answer to an earlier frame must not count for this one
-        SetEvent(g_go);
-        const DWORD w = WaitForSingleObject(g_done, timeout);
-        QueryPerformanceCounter(&t2);
-        if (w != WAIT_OBJECT_0) {
-            g_rtStatus = "helper didn't answer in time; round trip off";
-            Log("%s (helper status: %s)", g_rtStatus.c_str(), g_ctl->helperStatus);
-            g_rtFailed = true;
-        } else if (g_ctl->helperReady != g_ctl->generation) {
-            g_rtStatus = Format("helper error 0x%08lx: %s", static_cast<unsigned long>(g_ctl->helperError), g_ctl->helperStatus);
-            Log("%s", g_rtStatus.c_str());
-            g_rtFailed = true;
-        } else {
-            g_d9->StretchRect(out, nullptr, src, nullptr, D3DTEXF_NONE);
-            int seen = -1;
-            if (check && ReadMarker(out, seen)) {
-                if (seen == marker) {
-                    ++g_asyncOk;
-                } else {
-                    ++g_asyncStale;
-                    Log("low-latency hand-off: order check failed (marker %d, read %d)", marker, seen);
-                    if (g_asyncStale >= 2) {
-                        g_asyncBroken = true;
-                        Log("low-latency hand-off off: this system doesn't keep the GPU order between the processes");
-                    }
-                }
-                if (g_asyncOk == 1 || g_asyncOk % 60 == 0) Log("low-latency hand-off: %u order checks passed, %u failed", g_asyncOk, g_asyncStale);
-            }
-            QueryPerformanceFrequency(&f);
-            const double total = (t2.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
-            const double wait = (t2.QuadPart - t1.QuadPart) * 1000.0 / f.QuadPart;
-            g_rtMsAvg = g_rtFrames ? g_rtMsAvg * 0.95 + total * 0.05 : total;
-            g_rtWaitAvg = g_rtFrames ? g_rtWaitAvg * 0.95 + wait * 0.05 : wait;
-            if (++g_rtFrames == 1 || g_rtFrames % 600 == 0)
-                Log("round trip %llu: %.2f ms total, %.2f ms helper (helper's own %.2f ms), %u camera cuts so far",
-                    static_cast<unsigned long long>(g_rtFrames), total, wait, g_ctl->helperGpuMs, g_cuts);
-            g_rtStatus = Format("%s%s: %.2f ms per frame (helper %.2f ms). %s", async ? "Low-latency " : "",
-                                g_rtMode == 3 ? (g_ctl->mode == kModeDlaa ? "DLAA" : "DLAA (waiting for the 3D scene)")
-                                : g_rtMode == 2 ? "Invert test" : "Copy test",
-                                g_rtMsAvg, g_rtWaitAvg, g_ctl->helperStatus);
-        }
-    } else {
+    if (osh && g_objSurf) g_d9->StretchRect(g_objSurf, nullptr, osh, nullptr, D3DTEXF_NONE);
+    const bool copied = src && in && out && SUCCEEDED(g_d9->StretchRect(src, nullptr, in, nullptr, D3DTEXF_NONE));
+    if (!copied) {
         g_rtStatus = "copy into the shared texture failed";
+    } else if (pipelined) {
+        // Last frame's result over this frame's scene (after this frame's scene was copied out).
+        if (g_haveResult) g_d9->StretchRect(out, nullptr, src, nullptr, D3DTEXF_NONE);
+        g_haveResult = false;
+        g_pend = CaptureParams(depthOk);
+        g_inFlightTimeout = timeout;
+        g_query->Issue(D3DISSUE_END);
+        g_query->GetData(nullptr, 0, D3DGETDATA_FLUSH);  // submit, don't wait
+        g_queryPending = true;
+    } else if (WaitGpu()) {
+        Signal(CaptureParams(depthOk), timeout);
+        if (Collect()) g_d9->StretchRect(out, nullptr, src, nullptr, D3DTEXF_NONE);
     }
     if (src) src->Release();
     if (in) in->Release();
     if (out) out->Release();
     if (dsrc) dsrc->Release();
     if (dsh) dsh->Release();
+    if (osh) osh->Release();
+    if (g_rtFailed || !copied) return;
+
+    QueryPerformanceCounter(&t2);
+    QueryPerformanceFrequency(&f);
+    const double total = (t2.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+    const double drain = drainMs * 1000.0 / f.QuadPart;
+    g_rtMsAvg = g_rtFrames ? g_rtMsAvg * 0.95 + total * 0.05 : total;
+    g_rtWaitAvg = g_rtFrames ? g_rtWaitAvg * 0.95 + drain * 0.05 : drain;
+    if (++g_rtFrames == 1 || g_rtFrames % 600 == 0)
+        Log("round trip %llu (%s): %.2f ms on the game's render thread (%.2f ms collecting last frame), helper's own %.2f ms, "
+            "%u camera cuts so far",
+            static_cast<unsigned long long>(g_rtFrames), pipelined ? "pipelined" : "waiting", total, drain, g_ctl->helperGpuMs, g_cuts);
+    g_rtStatus = Format("%s%s: %.2f ms per frame on the game's thread (helper %.2f ms). %s", pipelined ? "Pipelined " : "",
+                        g_rtMode == 3 ? (g_pend.mode == kModeDlaa || !pipelined ? "DLAA" : "DLAA (waiting for the 3D scene)")
+                        : g_rtMode == 2 ? "Invert test" : "Copy test",
+                        g_rtMsAvg, g_ctl->helperGpuMs, g_ctl->helperStatus);
 }
 
 // Called from the draw event (before the game's draw runs).
