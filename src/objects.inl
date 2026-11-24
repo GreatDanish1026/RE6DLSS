@@ -223,6 +223,8 @@ bool PatchVs(const ObjVs& o, std::vector<uint32_t>& out, int& spareSampler, std:
 std::unordered_map<uintptr_t, ObjVs> g_objVs;  // render thread
 
 ObjVs& ObjVsInfo(IDirect3DVertexShader9* vs) {
+    auto it = g_objVs.find(reinterpret_cast<uintptr_t>(vs));
+    if (it != g_objVs.end() && it->second.size) return it->second;  // the game keeps its shaders: known by address
     UINT size = 0;
     vs->GetFunction(nullptr, &size);
     ObjVs& o = g_objVs[reinterpret_cast<uintptr_t>(vs)];
@@ -676,13 +678,24 @@ void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, Tar
     if (FAILED(dev->GetRenderTarget(0, &rt)) || !rt) return;
     const uintptr_t rtId = reinterpret_cast<uintptr_t>(rt);
     if (!g_batch.empty() && rtId != g_batchTarget) FlushMotion(dev);  // the batch's pass ended
-    D3DSURFACE_DESC rd = {};
-    rt->GetDesc(&rd);
-    IDirect3DTexture9* rtTex = nullptr;
-    rt->GetContainer(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&rtTex));
+    struct RtInfo {
+        UINT w, h;
+        IDirect3DTexture9* tex;  // compared only
+    };
+    static std::unordered_map<uintptr_t, RtInfo> rtCache;
+    auto rc = rtCache.find(rtId);
+    if (rc == rtCache.end()) {
+        D3DSURFACE_DESC rd = {};
+        rt->GetDesc(&rd);
+        IDirect3DTexture9* t = nullptr;
+        rt->GetContainer(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&t));
+        if (t) t->Release();
+        if (rtCache.size() > 4096) rtCache.clear();
+        rc = rtCache.emplace(rtId, RtInfo{rd.Width, rd.Height, t}).first;
+    }
     rt->Release();
-    if (rtTex) rtTex->Release();  // only compared
-    if (rd.Width != g_bbWidth || rd.Height != g_bbHeight) return;
+    IDirect3DTexture9* rtTex = rc->second.tex;
+    if (rc->second.w != g_bbWidth || rc->second.h != g_bbHeight) return;
     {
         auto ins = g_targetStats.try_emplace(reinterpret_cast<uintptr_t>(rtTex));
         ts = &ins.first->second;
@@ -700,8 +713,12 @@ void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, Tar
     dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
     dev->GetRenderState(D3DRS_ZWRITEENABLE, &zwrite);
 
-    if (blend && !zwrite) {  // world-space effect: mask
-        if (g_effectMaskOn) ReplayMask(dev, d);
+    if (blend && !zwrite) {  // world-space effect: snapshot of the scene before the first one (effect mask)
+        if (g_effectMaskOn && !g_fxSnapped && g_fxPrivSurf && rtTex && rtTex == g_sceneTexLast) {
+            g_fxSnapped = SUCCEEDED(dev->StretchRect(reinterpret_cast<IDirect3DSurface9*>(rtId), nullptr, g_fxPrivSurf, nullptr,
+                                                     D3DTEXF_NONE));
+            if (g_fxSnapped) ++g_objStats.maskDraws;
+        }
         return;
     }
     if (o.boneSampler >= 0) ++ts->skinned;
@@ -906,4 +923,5 @@ void ObjectsFrameEnd() {  // at present (after this frame's round trip)
     g_objStats.motionDraws = g_objStats.maskDraws = g_objStats.skipped = 0;
     g_objStats.cpuMs = 0;
     g_objWritten = g_maskWritten = false;
+    g_fxSnapped = false;
 }

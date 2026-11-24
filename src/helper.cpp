@@ -75,7 +75,9 @@ cbuffer Frame : register(b0) {
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> depthTex : register(t1);
-Texture2D<float4> objTex : register(t2);  // object motion (rg, b = valid) and effect mask (a), from the add-on
+Texture2D<float4> objTex : register(t2);  // object motion (rg, b = valid), from the add-on
+Texture2D<float4> fxTex : register(t3);   // the scene before its first see-through effect
+Texture2D<float> maskView : register(t4); // the effect mask (developer view)
 
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -109,9 +111,15 @@ float2 motion(float4 pos : SV_Position) : SV_Target {
     return mv;
 }
 // Effect mask for DLSS (bias towards this frame's colour).
+// Effect mask: how much the see-through effects (drawn after the snapshot) changed the pixel,
+// relative to its brightness.
 float mask(float4 pos : SV_Position) : SV_Target {
-    float a = objTex.Load(int3(pos.xy, 0)).a;
-    return isnan(a) ? 0 : saturate(a);
+    float3 f = src.Load(int3(pos.xy, 0)).rgb, b = fxTex.Load(int3(pos.xy, 0)).rgb;
+    if (any(isnan(f)) || any(isnan(b)) || any(isinf(f)) || any(isinf(b))) return 0;
+    float3 d = abs(f - b);
+    float change = max(d.r, max(d.g, d.b));
+    float level = max(f.r, max(f.g, f.b)) + max(b.r, max(b.g, b.b)) + 0.02;
+    return saturate(4.0 * change / level);
 }
 // Developer views, shown instead of the picture: motion vectors (red/green = x/y, blue = object
 // motion from the add-on) or the effect mask.
@@ -121,7 +129,7 @@ float4 debugMotion(float4 pos : SV_Position) : SV_Target {
     return float4(saturate(abs(mv) / 16.0), obj, 1);
 }
 float4 debugMask(float4 pos : SV_Position) : SV_Target {
-    float a = saturate(objTex.Load(int3(pos.xy, 0)).a);
+    float a = saturate(maskView.Load(int3(pos.xy, 0)));
     return float4(a, a, a, 1);
 }
 // Colour as DLSS gets it: NaN, infinite or negative values (the game's skin shading can produce
@@ -152,8 +160,8 @@ struct Gpu {
     ID3D11Query* query = nullptr;
     ID3D11Query *disjoint = nullptr, *ts[4] = {};  // GPU timing: start, after prep passes, after DLSS, end
     // shared (opened from the add-on's D3D9Ex handles)
-    ID3D11Texture2D *in = nullptr, *out = nullptr, *depthPacked = nullptr, *obj = nullptr;
-    ID3D11ShaderResourceView *inSrv = nullptr, *depthPackedSrv = nullptr, *objSrv = nullptr;
+    ID3D11Texture2D *in = nullptr, *out = nullptr, *depthPacked = nullptr, *obj = nullptr, *fx = nullptr;
+    ID3D11ShaderResourceView *inSrv = nullptr, *depthPackedSrv = nullptr, *objSrv = nullptr, *fxSrv = nullptr, *maskSrv = nullptr;
     ID3D11RenderTargetView* outRtv = nullptr;
     // ours
     ID3D11Texture2D *depth = nullptr, *mv = nullptr, *dlssOut = nullptr, *color = nullptr, *maskTex = nullptr;
@@ -196,8 +204,8 @@ bool Compile(Gpu& g) {
 }
 
 void ReleaseTextures(Gpu& g) {
-    Release(g.inSrv), Release(g.depthPackedSrv), Release(g.outRtv), Release(g.objSrv);
-    Release(g.in), Release(g.out), Release(g.depthPacked), Release(g.obj);
+    Release(g.inSrv), Release(g.depthPackedSrv), Release(g.outRtv), Release(g.objSrv), Release(g.fxSrv), Release(g.maskSrv);
+    Release(g.in), Release(g.out), Release(g.depthPacked), Release(g.obj), Release(g.fx);
     Release(g.mvSrv), Release(g.maskRtv), Release(g.maskTex);
     Release(g.depthSrv), Release(g.depthRtv), Release(g.mvRtv), Release(g.colorRtv);
     Release(g.depth), Release(g.mv), Release(g.dlssOut), Release(g.color);
@@ -218,7 +226,11 @@ HRESULT OpenTextures(Gpu& g, SharedControl* ctl) {
     if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.out, nullptr, &g.outRtv);
     if (SUCCEEDED(hr) && ctl->objHandle) {  // optional: older add-on builds don't send it
         if (SUCCEEDED(OpenShared(g, ctl->objHandle, &g.obj))) g.dev->CreateShaderResourceView(g.obj, nullptr, &g.objSrv);
-        else Log("couldn't open the object texture; object motion and effect mask off");
+        else Log("couldn't open the object texture; object motion off");
+    }
+    if (SUCCEEDED(hr) && ctl->fxHandle) {
+        if (SUCCEEDED(OpenShared(g, ctl->fxHandle, &g.fx))) g.dev->CreateShaderResourceView(g.fx, nullptr, &g.fxSrv);
+        else Log("couldn't open the effect snapshot; effect mask off");
     }
     if (FAILED(hr)) return hr;
     D3D11_TEXTURE2D_DESC d;
@@ -239,6 +251,7 @@ HRESULT OpenTextures(Gpu& g, SharedControl* ctl) {
     if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(g.mv, nullptr, &g.mvSrv);
     if (SUCCEEDED(hr)) hr = make(DXGI_FORMAT_R8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &g.maskTex);
     if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.maskTex, nullptr, &g.maskRtv);
+    if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(g.maskTex, nullptr, &g.maskSrv);
     if (FAILED(hr)) return hr;
     Log("opened shared textures: %ux%u format %u (generation %u)", d.Width, d.Height, d.Format, ctl->generation);
     g.generation = ctl->generation;
@@ -256,8 +269,8 @@ void FullScreen(Gpu& g, ID3D11RenderTargetView* rtv, ID3D11PixelShader* ps, ID3D
     g.ctx->PSSetConstantBuffers(0, 1, &g.cb);
     g.ctx->PSSetShaderResources(0, nsrv, srvs);
     g.ctx->Draw(3, 0);
-    ID3D11ShaderResourceView* none[3] = {};
-    g.ctx->PSSetShaderResources(0, 3, none);
+    ID3D11ShaderResourceView* none[5] = {};
+    g.ctx->PSSetShaderResources(0, 5, none);
     g.ctx->OMSetRenderTargets(0, nullptr, nullptr);
 }
 
@@ -314,7 +327,7 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
     memcpy(cb.prevVp, ctl->havePrev ? ctl->prevViewProj : ctl->viewProj, sizeof(cb.prevVp));
     cb.size[0] = static_cast<float>(g.width), cb.size[1] = static_cast<float>(g.height);
     const bool objects = g.objSrv && (ctl->objFlags & kObjMotion);
-    const bool masked = g.objSrv && (ctl->objFlags & kObjMask);
+    const bool masked = g.fxSrv && (ctl->objFlags & kObjMask);
     cb.useObjects = objects ? 1.0f : 0.0f;
     g.ctx->UpdateSubresource(g.cb, 0, nullptr, &cb, 0, 0);
 
@@ -323,8 +336,8 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
     ID3D11ShaderResourceView* motionSrvs[3] = {g.inSrv, g.depthSrv, g.objSrv};  // depth at t1, objects at t2
     FullScreen(g, g.mvRtv, g.motion, motionSrvs, 3);
     if (masked) {
-        ID3D11ShaderResourceView* maskSrvs[3] = {nullptr, nullptr, g.objSrv};
-        FullScreen(g, g.maskRtv, g.mask, maskSrvs, 3);
+        ID3D11ShaderResourceView* maskSrvs[4] = {g.inSrv, nullptr, nullptr, g.fxSrv};
+        FullScreen(g, g.maskRtv, g.mask, maskSrvs, 4);
     }
     if (g.ts[1]) g.ctx->End(g.ts[1]);
 
@@ -352,9 +365,13 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
     if (ctl->debugView == 1) {
         ID3D11ShaderResourceView* srvs[3] = {g.mvSrv, nullptr, g.objSrv};
         FullScreen(g, g.outRtv, g.debugMotion, srvs, 3);
-    } else if (ctl->debugView == 2 && g.objSrv) {
-        ID3D11ShaderResourceView* srvs[3] = {nullptr, nullptr, g.objSrv};
-        FullScreen(g, g.outRtv, g.debugMask, srvs, 3);
+    } else if (ctl->debugView == 2) {
+        if (!masked) {
+            const float black[4] = {0, 0, 0, 0};
+            g.ctx->ClearRenderTargetView(g.maskRtv, black);
+        }
+        ID3D11ShaderResourceView* srvs[5] = {nullptr, nullptr, nullptr, nullptr, g.maskSrv};
+        FullScreen(g, g.outRtv, g.debugMask, srvs, 5);
     }
     snprintf(ctl->helperStatus, sizeof(ctl->helperStatus), "DLSS %s", dlss::Status().c_str());
 }

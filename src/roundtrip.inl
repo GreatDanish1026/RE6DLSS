@@ -36,6 +36,13 @@ IDirect3DTexture9* g_depthTex = nullptr;
 IDirect3DTexture9* g_objShared = nullptr;  // copy of g_objTex for the helper
 IDirect3DTexture9* g_objTex = nullptr;     // moving objects' motion + effect mask, written during the scene (objects.inl)
 IDirect3DSurface9* g_objSurf = nullptr;
+// Effect mask: the scene is copied once per frame just before its first see-through effect (fire,
+// smoke, sparks; objects.inl); the helper compares it with the finished scene.
+IDirect3DTexture9* g_fxPriv = nullptr;     // that copy (written during the scene)
+IDirect3DSurface9* g_fxPrivSurf = nullptr;
+IDirect3DTexture9* g_fxShared = nullptr;   // copied to the helper at the tonemap draw
+bool g_fxSnapped = false;                  // this frame
+IDirect3DTexture9* g_sceneTexLast = nullptr;  // the tonemap's input texture (last seen; compared only)
 bool g_objMotionOn = true, g_effectMaskOn = true;  // settings
 bool g_pipelineOn = true;                // setting: pipelined hand-off
 int g_debugView = 0;                     // developer: 1 motion vectors, 2 effect mask
@@ -122,8 +129,11 @@ bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt, D3DFORMAT depthFmt) {
     if (g_objShared) g_objShared->Release(), g_objShared = nullptr;
     if (g_objSurf) g_objSurf->Release(), g_objSurf = nullptr;
     if (g_objTex) g_objTex->Release(), g_objTex = nullptr;
+    if (g_fxPrivSurf) g_fxPrivSurf->Release(), g_fxPrivSurf = nullptr;
+    if (g_fxPriv) g_fxPriv->Release(), g_fxPriv = nullptr;
+    if (g_fxShared) g_fxShared->Release(), g_fxShared = nullptr;
     g_haveResult = false;
-    HANDLE hin = nullptr, hout = nullptr, hdepth = nullptr, hobj = nullptr;
+    HANDLE hin = nullptr, hout = nullptr, hdepth = nullptr, hobj = nullptr, hfx = nullptr;
     HRESULT hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_inTex, &hin);
     if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_outTex, &hout);
     if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, depthFmt, D3DPOOL_DEFAULT, &g_depthTex, &hdepth);
@@ -133,7 +143,10 @@ bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt, D3DFORMAT depthFmt) {
         hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_objTex, nullptr);
     if (SUCCEEDED(hr)) hr = g_objTex->GetSurfaceLevel(0, &g_objSurf);
     if (SUCCEEDED(hr)) g_d9->ColorFill(g_objSurf, nullptr, 0);
-    if (FAILED(hr) || !hin || !hout || !hdepth || !hobj) {
+    if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_fxPriv, nullptr);
+    if (SUCCEEDED(hr)) hr = g_fxPriv->GetSurfaceLevel(0, &g_fxPrivSurf);
+    if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_fxShared, &hfx);
+    if (FAILED(hr) || !hin || !hout || !hdepth || !hobj || !hfx) {
         g_rtStatus = Format("shared texture creation failed (0x%08lx)", hr);
         Log("%s", g_rtStatus.c_str());
         return false;
@@ -144,6 +157,7 @@ bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt, D3DFORMAT depthFmt) {
     g_ctl->outHandle = reinterpret_cast<uintptr_t>(hout);
     g_ctl->depthHandle = reinterpret_cast<uintptr_t>(hdepth);
     g_ctl->objHandle = reinterpret_cast<uintptr_t>(hobj);
+    g_ctl->fxHandle = reinterpret_cast<uintptr_t>(hfx);
     g_ctl->width = w, g_ctl->height = h;
     g_ctl->format = DxgiOf(fmt);
     ++g_ctl->generation;
@@ -186,7 +200,7 @@ FrameParams CaptureParams(bool depthOk) {
     if (cut) ++g_cuts;
     p.reset = static_cast<int>(p.mode) != g_lastSentMode || cut ? 1 : 0;
     p.preset = g_dlssPreset;
-    p.objFlags = (g_objMotionOn ? kObjMotion : 0u) | (g_effectMaskOn ? kObjMask : 0u);
+    p.objFlags = (g_objMotionOn ? kObjMotion : 0u) | (g_effectMaskOn && g_fxSnapped ? kObjMask : 0u);
     p.debugView = static_cast<uint32_t>(g_debugView);
     g_lastSentMode = static_cast<int>(p.mode);
     return p;
@@ -301,6 +315,11 @@ void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
     g_objShared->GetSurfaceLevel(0, &osh);
     const bool depthOk = dsrc && dsh && SUCCEEDED(g_d9->StretchRect(dsrc, nullptr, dsh, nullptr, D3DTEXF_NONE));
     if (osh && g_objSurf) g_d9->StretchRect(g_objSurf, nullptr, osh, nullptr, D3DTEXF_NONE);
+    if (g_fxSnapped && g_fxPrivSurf) {
+        IDirect3DSurface9* fsh = nullptr;
+        g_fxShared->GetSurfaceLevel(0, &fsh);
+        if (fsh) g_d9->StretchRect(g_fxPrivSurf, nullptr, fsh, nullptr, D3DTEXF_NONE), fsh->Release();
+    }
     const bool copied = src && in && out && SUCCEEDED(g_d9->StretchRect(src, nullptr, in, nullptr, D3DTEXF_NONE));
     if (!copied) {
         g_rtStatus = "copy into the shared texture failed";
@@ -359,6 +378,7 @@ void MaybeRoundTrip(command_list* cl) {
     IDirect3DTexture9* tex = nullptr;
     if (FAILED(res->QueryInterface(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&tex))) || !tex) return;
     g_rtDoneThisFrame = true;
+    g_sceneTexLast = tex;
     IDirect3DTexture9* depth = nullptr;
     if (g_depthRes.handle)
         reinterpret_cast<IDirect3DResource9*>(g_depthRes.handle)

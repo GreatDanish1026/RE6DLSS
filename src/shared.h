@@ -5,7 +5,7 @@
 #pragma once
 #include <cstdint>
 
-#define RD_SHARED_VERSION 4u
+#define RD_SHARED_VERSION 5u
 
 enum : uint32_t { kModeCopy = 0, kModeInvert = 1, kModeDlaa = 2 };
 enum : uint32_t { kObjMotion = 1, kObjMask = 2 };
@@ -39,4 +39,6 @@ struct SharedControl {
     uint32_t debugView;      // 0 off, 1 motion vectors, 2 effect mask (shown instead of the picture)
     uint32_t async;          // 1: answer once the work is submitted (GPU order kept by the OS), not when done
     uint32_t checkMarker;    // non-zero: copy the input's top-left pixel to the output's (order check)
+    // version 5
+    uint64_t fxHandle;       // the scene just before its first see-through effect (effect mask = what changed since)
 };
