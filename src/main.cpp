@@ -447,7 +447,7 @@ struct Context {
     float vsConst[256 * 4] = {}, psConst[224 * 4] = {};  // D3D9 float constant registers
     bool dumpVsNext = false;
     bool sceneTarget = false;  // render target 0 is back-buffer sized (jitter)
-    bool jittered = false;     // c1..c4 on the device are our jittered copy                              // capture: dump VS constants at next scene draw
+    int jitteredReg = -1;      // first register of our jittered fViewProj copy on the device, -1 none
     viewport vp = {};
     std::vector<resource_view> rtvs;
     resource_view dsv = {0};
@@ -566,7 +566,9 @@ void OnPushConstants(command_list* cl, shader_stage stages, pipeline_layout, uin
     if (!dst || first >= cap) return;
     if (first + count > cap) count = cap - first;
     memcpy(dst + first, values, count * 4);
-    if (dst == c.vsConst && first < 20 && first + count > 4) c.jittered = false;  // c1..c4 rewritten by the game
+    if (dst == c.vsConst && c.jitteredReg >= 0 && first <= static_cast<uint32_t>(c.jitteredReg) * 4 &&
+        first + count >= static_cast<uint32_t>(c.jitteredReg) * 4 + 16)
+        c.jitteredReg = -1;  // the game rewrote the whole jittered matrix
 }
 
 void OnBindViewports(command_list* cl, uint32_t first, uint32_t count, const viewport* vps) {
@@ -801,7 +803,7 @@ void Other(command_list* cl) {
 bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
     MaybeRoundTrip(cl);
     MarkTonemap(cl);
-    MaybeJitter(cl, vertices <= 4 && instances == 1);
+    MaybeJitter(cl);
     if (!Recording()) return false;
     if (vertices <= 4 && instances == 1) Pass(cl, false, Format("draw %u verts", vertices));
     else Other(cl);
@@ -809,7 +811,7 @@ bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, u
 }
 
 bool OnDrawIndexed(command_list* cl, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
-    MaybeJitter(cl, indices <= 6 && instances == 1);
+    MaybeJitter(cl);
     if (!Recording()) return false;
     if (indices <= 6 && instances == 1) Pass(cl, false, Format("draw %u indices", indices));
     else Other(cl);
