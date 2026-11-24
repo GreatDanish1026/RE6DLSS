@@ -118,6 +118,7 @@ struct ObjVs {
     VsShape shape;
     std::vector<uint32_t> code;
     bool patchTried = false;
+    bool usesIntBool = false;  // int/bool constants (loops, branches)
     IDirect3DVertexShader9* patched = nullptr;
     int spareSampler = -1;
 };
@@ -242,6 +243,8 @@ ObjVs& ObjVsInfo(IDirect3DVertexShader9* vs) {
         else if (c.set == 2 && c.name == "CBSkinning__packed0") o.skinReg = c.reg;
     }
     o.shape = AnalyzeVs(code, cs);
+    for (const ShaderConst& c : cs)
+        if (c.set == 0 || c.set == 1) o.usesIntBool = true;
     if (o.vpReg >= 0 && (o.worldReg >= 0 || o.boneSampler >= 0)) o.code = std::move(code);
     return o;
 }
@@ -269,9 +272,15 @@ struct TargetStats {
 };
 std::map<uintptr_t, TargetStats> g_targetStats;  // per render target 0 texture, this frame
 uint32_t g_targetOrder = 0;
-// The scene has two colour passes that both draw every character (lighting and colour); motion
-// is replayed in the first one only (the first non-pre-pass target with a moving draw this frame).
-uintptr_t g_motionTarget = 0;
+// The scene has two colour passes; a character part can be drawn in either or both. Each moving
+// draw is replayed once per frame: same geometry with the same bone offset / world matrix = done.
+std::unordered_set<uint64_t> g_replayed;
+
+uint64_t Fnv(uint64_t h, const void* p, size_t n) {
+    const auto* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
 uint32_t g_patchFailLogs = 0;
 
 using D3DCompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT,
@@ -402,7 +411,7 @@ struct SavedStates {
     }
 };
 
-void ReplayMotion(IDirect3DDevice9* dev, IDirect3DVertexShader9* gameVs, ObjVs& o, const DrawHist& prev, const DrawArgs& d) {
+bool EnsurePatched(IDirect3DDevice9* dev, IDirect3DVertexShader9* gameVs, ObjVs& o) {
     if (!o.patchTried) {
         o.patchTried = true;
         std::vector<uint32_t> code;
@@ -418,50 +427,134 @@ void ReplayMotion(IDirect3DDevice9* dev, IDirect3DVertexShader9* gameVs, ObjVs& 
             ++g_objStats.patched;
         }
     }
-    if (!o.patched) return;
+    return o.patched != nullptr;
+}
+
+// Motion replays are batched per pass: each moving draw is recorded (geometry, the device's vertex
+// shader constants as drawn, i.e. with the jitter, bones) and the batch is drawn at the end of the
+// pass, with the device state saved and restored once instead of per draw (render target
+// switches are what makes a D3D9 replay expensive).
+struct MotionItem {
+    DrawArgs d;
+    IDirect3DVertexShader9* vs;
+    IDirect3DVertexDeclaration9* decl;
+    IDirect3DIndexBuffer9* ib;
+    IDirect3DVertexBuffer9* vb[4];
+    UINT off[4], stride[4], freq[4];
+    IDirect3DBaseTexture9* bones;
+    int boneSampler, spareSampler;
+    DWORD cull, depthBias, slopeBias;
+    uint32_t nConst;
+    size_t constOfs;  // into g_batchConsts
+    bool intBool;
+    int ints[64];
+    BOOL bools[16];
+    float spare[32];  // c248..c255: last frame's camera, world, bone offset
+};
+std::vector<MotionItem> g_batch;
+std::vector<float> g_batchConsts;
+uintptr_t g_batchTarget = 0;              // render target 0 surface of the batch's pass
+IDirect3DSurface9* g_batchDs = nullptr;   // its depth buffer (AddRef'd)
+uint32_t g_batches = 0;
+
+template <typename T>
+void SafeRelease(T*& p) {
+    if (p) p->Release(), p = nullptr;
+}
+
+void RecordMotion(IDirect3DDevice9* dev, IDirect3DVertexShader9* gameVs, ObjVs& o, const DrawHist& prev, const DrawArgs& d,
+                  uintptr_t target) {
+    if (!EnsurePatched(dev, gameVs, o)) return;
     if (o.boneSampler >= 0 && !g_prevBonesValid) return;
-    const DWORD vsamp = D3DVERTEXTEXTURESAMPLER0 + static_cast<DWORD>(o.spareSampler);
+    if (g_batch.empty()) {
+        g_batchTarget = target;
+        SafeRelease(g_batchDs);
+        dev->GetDepthStencilSurface(&g_batchDs);
+    }
+    MotionItem m = {};
+    m.d = d;
+    m.vs = o.patched;
+    m.vs->AddRef();
+    dev->GetVertexDeclaration(&m.decl);
+    if (d.indexed) dev->GetIndices(&m.ib);
+    for (UINT s = 0; s < 4; ++s) {
+        dev->GetStreamSource(s, &m.vb[s], &m.off[s], &m.stride[s]);
+        dev->GetStreamSourceFreq(s, &m.freq[s]);
+    }
+    m.boneSampler = o.boneSampler, m.spareSampler = o.spareSampler;
+    if (o.boneSampler >= 0) dev->GetTexture(D3DVERTEXTEXTURESAMPLER0 + static_cast<DWORD>(o.boneSampler), &m.bones);
+    dev->GetRenderState(D3DRS_CULLMODE, &m.cull);
+    dev->GetRenderState(D3DRS_DEPTHBIAS, &m.depthBias);
+    dev->GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, &m.slopeBias);
+    m.nConst = static_cast<uint32_t>(std::min(std::max(o.shape.maxConst + 1, 1), kSpareConst));
+    m.constOfs = g_batchConsts.size();
+    g_batchConsts.resize(m.constOfs + m.nConst * 4);
+    dev->GetVertexShaderConstantF(0, &g_batchConsts[m.constOfs], m.nConst);
+    m.intBool = o.usesIntBool;
+    if (m.intBool) {
+        dev->GetVertexShaderConstantI(0, m.ints, 16);
+        dev->GetVertexShaderConstantB(0, m.bools, 16);
+    }
+    memcpy(m.spare, g_prevVp, sizeof(float) * 16);
+    memcpy(m.spare + 16, prev.world, sizeof(prev.world));
+    memcpy(m.spare + 28, prev.skin, sizeof(prev.skin));
+    g_batch.push_back(m);
+}
+
+void FlushMotion(IDirect3DDevice9* dev) {
+    if (g_batch.empty()) return;
+    const bool wasInHook = g_inDrawHook;
+    g_inDrawHook = true;  // our draws must not be taken for the game's
     // Save.
     SavedTargets targets;
     targets.Save(dev);
+    IDirect3DSurface9* ds = nullptr;
+    dev->GetDepthStencilSurface(&ds);
     SavedStates states;
     states.Save(dev);
+    DWORD cull, bias, slope, scissor;
+    dev->GetRenderState(D3DRS_CULLMODE, &cull);
+    dev->GetRenderState(D3DRS_DEPTHBIAS, &bias);
+    dev->GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, &slope);
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &scissor);
+    IDirect3DVertexShader9* vs = nullptr;
     IDirect3DPixelShader9* ps = nullptr;
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    IDirect3DIndexBuffer9* ib = nullptr;
+    dev->GetVertexShader(&vs);
     dev->GetPixelShader(&ps);
-    float psC0[4], vsSpare[32];
-    dev->GetPixelShaderConstantF(0, psC0, 1);
-    dev->GetVertexShaderConstantF(kSpareConst, vsSpare, 8);
-    IDirect3DBaseTexture9* oldTex = nullptr;
-    DWORD samp[5] = {};
-    if (o.spareSampler >= 0) {
-        dev->GetTexture(vsamp, &oldTex);
-        dev->GetSamplerState(vsamp, D3DSAMP_MINFILTER, &samp[0]);
-        dev->GetSamplerState(vsamp, D3DSAMP_MAGFILTER, &samp[1]);
-        dev->GetSamplerState(vsamp, D3DSAMP_MIPFILTER, &samp[2]);
-        dev->GetSamplerState(vsamp, D3DSAMP_ADDRESSU, &samp[3]);
-        dev->GetSamplerState(vsamp, D3DSAMP_ADDRESSV, &samp[4]);
+    dev->GetVertexDeclaration(&decl);
+    dev->GetIndices(&ib);
+    IDirect3DVertexBuffer9* vb[4] = {};
+    UINT off[4] = {}, stride[4] = {}, freq[4] = {};
+    for (UINT s = 0; s < 4; ++s) {
+        dev->GetStreamSource(s, &vb[s], &off[s], &stride[s]);
+        dev->GetStreamSourceFreq(s, &freq[s]);
     }
-    // Set.
+    static float vsF[256 * 4];
+    int vsI[64];
+    BOOL vsB[16];
+    float psC0[4];
+    dev->GetVertexShaderConstantF(0, vsF, 256);
+    dev->GetVertexShaderConstantI(0, vsI, 16);
+    dev->GetVertexShaderConstantB(0, vsB, 16);
+    dev->GetPixelShaderConstantF(0, psC0, 1);
+    IDirect3DBaseTexture9* vtex[4] = {};
+    DWORD vsamp[4][5] = {};
+    const D3DSAMPLERSTATETYPE kSamp[5] = {D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV};
+    for (DWORD i = 0; i < 4; ++i) {
+        dev->GetTexture(D3DVERTEXTEXTURESAMPLER0 + i, &vtex[i]);
+        for (int k = 0; k < 5; ++k) dev->GetSamplerState(D3DVERTEXTEXTURESAMPLER0 + i, kSamp[k], &vsamp[i][k]);
+    }
+    // Common state.
     dev->SetRenderTarget(0, g_objSurf);
     for (DWORD i = 1; i < 4; ++i) dev->SetRenderTarget(i, nullptr);
-    dev->SetViewport(&targets.vp);
-    dev->SetVertexShader(o.patched);
+    dev->SetDepthStencilSurface(g_batchDs);
+    D3DVIEWPORT9 full = {0, 0, g_bbWidth, g_bbHeight, 0.0f, 1.0f};
+    dev->SetViewport(&full);
     dev->SetPixelShader(g_motionPs);
     const float c0[4] = {static_cast<float>(g_bbWidth), static_cast<float>(g_bbHeight), g_jitterX, g_jitterY};
     dev->SetPixelShaderConstantF(0, c0, 1);
-    float spare[32] = {};
-    memcpy(spare, g_prevVp, sizeof(float) * 16);
-    memcpy(spare + 16, prev.world, sizeof(prev.world));
-    memcpy(spare + 28, prev.skin, sizeof(prev.skin));
-    dev->SetVertexShaderConstantF(kSpareConst, spare, 8);
-    if (o.spareSampler >= 0) {
-        dev->SetTexture(vsamp, g_prevBones);
-        dev->SetSamplerState(vsamp, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-        dev->SetSamplerState(vsamp, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-        dev->SetSamplerState(vsamp, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-        dev->SetSamplerState(vsamp, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-        dev->SetSamplerState(vsamp, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-    }
     dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
     dev->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
@@ -471,24 +564,77 @@ void ReplayMotion(IDirect3DDevice9* dev, IDirect3DVertexShader9* gameVs, ObjVs& 
     dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
     dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-    if (SUCCEEDED(Redraw(dev, d))) ++g_objStats.motionDraws, g_objWritten = true;
-    // Restore.
-    if (o.spareSampler >= 0) {
-        dev->SetTexture(vsamp, oldTex);
-        dev->SetSamplerState(vsamp, D3DSAMP_MINFILTER, samp[0]);
-        dev->SetSamplerState(vsamp, D3DSAMP_MAGFILTER, samp[1]);
-        dev->SetSamplerState(vsamp, D3DSAMP_MIPFILTER, samp[2]);
-        dev->SetSamplerState(vsamp, D3DSAMP_ADDRESSU, samp[3]);
-        dev->SetSamplerState(vsamp, D3DSAMP_ADDRESSV, samp[4]);
-        if (oldTex) oldTex->Release();
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    for (DWORD i = 0; i < 4; ++i) {
+        dev->SetSamplerState(D3DVERTEXTEXTURESAMPLER0 + i, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        dev->SetSamplerState(D3DVERTEXTEXTURESAMPLER0 + i, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        dev->SetSamplerState(D3DVERTEXTEXTURESAMPLER0 + i, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        dev->SetSamplerState(D3DVERTEXTEXTURESAMPLER0 + i, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        dev->SetSamplerState(D3DVERTEXTEXTURESAMPLER0 + i, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
     }
-    dev->SetVertexShaderConstantF(kSpareConst, vsSpare, 8);
+    // The batch.
+    const MotionItem* last = nullptr;
+    for (const MotionItem& m : g_batch) {
+        if (!last || last->vs != m.vs) dev->SetVertexShader(m.vs);
+        if (!last || last->decl != m.decl) dev->SetVertexDeclaration(m.decl);
+        if (m.d.indexed && (!last || last->ib != m.ib)) dev->SetIndices(m.ib);
+        for (UINT s = 0; s < 4; ++s) {
+            if (!last || last->vb[s] != m.vb[s] || last->off[s] != m.off[s] || last->stride[s] != m.stride[s])
+                dev->SetStreamSource(s, m.vb[s], m.off[s], m.stride[s]);
+            if (!last || last->freq[s] != m.freq[s]) dev->SetStreamSourceFreq(s, m.freq[s]);
+        }
+        dev->SetVertexShaderConstantF(0, &g_batchConsts[m.constOfs], m.nConst);
+        dev->SetVertexShaderConstantF(kSpareConst, m.spare, 8);
+        if (m.intBool) {
+            dev->SetVertexShaderConstantI(0, m.ints, 16);
+            dev->SetVertexShaderConstantB(0, m.bools, 16);
+        }
+        if (m.boneSampler >= 0) dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + static_cast<DWORD>(m.boneSampler), m.bones);
+        if (m.spareSampler >= 0) dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + static_cast<DWORD>(m.spareSampler), g_prevBones);
+        if (!last || last->cull != m.cull) dev->SetRenderState(D3DRS_CULLMODE, m.cull);
+        if (!last || last->depthBias != m.depthBias) dev->SetRenderState(D3DRS_DEPTHBIAS, m.depthBias);
+        if (!last || last->slopeBias != m.slopeBias) dev->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, m.slopeBias);
+        if (SUCCEEDED(Redraw(dev, m.d))) ++g_objStats.motionDraws, g_objWritten = true;
+        last = &m;
+    }
+    // Restore.
+    for (DWORD i = 0; i < 4; ++i) {
+        dev->SetTexture(D3DVERTEXTEXTURESAMPLER0 + i, vtex[i]);
+        for (int k = 0; k < 5; ++k) dev->SetSamplerState(D3DVERTEXTEXTURESAMPLER0 + i, kSamp[k], vsamp[i][k]);
+        SafeRelease(vtex[i]);
+    }
+    dev->SetVertexShaderConstantF(0, vsF, 256);
+    dev->SetVertexShaderConstantI(0, vsI, 16);
+    dev->SetVertexShaderConstantB(0, vsB, 16);
     dev->SetPixelShaderConstantF(0, psC0, 1);
+    for (UINT s = 0; s < 4; ++s) {
+        dev->SetStreamSource(s, vb[s], off[s], stride[s]);
+        dev->SetStreamSourceFreq(s, freq[s]);
+        SafeRelease(vb[s]);
+    }
+    dev->SetIndices(ib);
+    dev->SetVertexDeclaration(decl);
+    dev->SetVertexShader(vs);
     dev->SetPixelShader(ps);
-    if (ps) ps->Release();
-    dev->SetVertexShader(gameVs);
+    SafeRelease(ib), SafeRelease(decl), SafeRelease(vs), SafeRelease(ps);
+    dev->SetRenderState(D3DRS_CULLMODE, cull);
+    dev->SetRenderState(D3DRS_DEPTHBIAS, bias);
+    dev->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, slope);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, scissor);
     states.Restore(dev);
     targets.Restore(dev);
+    dev->SetDepthStencilSurface(ds);
+    SafeRelease(ds);
+    for (MotionItem& m : g_batch) {
+        SafeRelease(m.vs), SafeRelease(m.decl), SafeRelease(m.ib), SafeRelease(m.bones);
+        for (auto*& v : m.vb) SafeRelease(v);
+    }
+    g_batch.clear();
+    g_batchConsts.clear();
+    SafeRelease(g_batchDs);
+    g_batchTarget = 0;
+    ++g_batches;
+    g_inDrawHook = wasInHook;
 }
 
 void ReplayMask(IDirect3DDevice9* dev, const DrawArgs& d) {
@@ -528,6 +674,8 @@ void OnSceneDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib) {
 void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, TargetStats*& ts) {
     IDirect3DSurface9* rt = nullptr;
     if (FAILED(dev->GetRenderTarget(0, &rt)) || !rt) return;
+    const uintptr_t rtId = reinterpret_cast<uintptr_t>(rt);
+    if (!g_batch.empty() && rtId != g_batchTarget) FlushMotion(dev);  // the batch's pass ended
     D3DSURFACE_DESC rd = {};
     rt->GetDesc(&rd);
     IDirect3DTexture9* rtTex = nullptr;
@@ -559,9 +707,6 @@ void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, Tar
     if (o.boneSampler >= 0) ++ts->skinned;
     else if (o.worldReg >= 0) ++ts->rigid;
     if (!g_objMotionOn || !zwrite || (o.worldReg < 0 && o.boneSampler < 0)) return;
-    const uintptr_t target = reinterpret_cast<uintptr_t>(rtTex);
-    if (!g_motionTarget) g_motionTarget = target;
-    if (target != g_motionTarget) return;
     // History of this draw (keyed by its geometry and how often it was drawn so far this frame).
     IDirect3DVertexBuffer9* vbp = nullptr;
     UINT off = 0, stride = 0;
@@ -593,9 +738,12 @@ void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, Tar
     }
     const bool moved = o.boneSampler >= 0 || memcmp(it->second.world, cur.world, sizeof(cur.world)) != 0;
     if (!moved) return;  // static: the camera motion is right
+    uint64_t h = Fnv(1469598103934665603ull, &k, offsetof(DrawKey, n));  // geometry, not the occurrence
+    h = Fnv(h, &cur, sizeof(cur));
+    if (!g_replayed.insert(h).second) return;  // already replayed in the other colour pass
     IDirect3DVertexShader9* gameVs = nullptr;
     dev->GetVertexShader(&gameVs);
-    ReplayMotion(dev, gameVs, o, it->second, d);
+    RecordMotion(dev, gameVs, o, it->second, d, rtId);
     if (gameVs) gameVs->Release();
 }
 
@@ -726,6 +874,7 @@ void CopyBones() {
 }
 
 void ObjectsFrameEnd() {  // at present (after this frame's round trip)
+    if (g_d9) FlushMotion(g_d9);
     if (g_d9) HookDraws(g_d9);
     PollPipeline();
     if (ObjectsActive()) {
@@ -753,7 +902,7 @@ void ObjectsFrameEnd() {  // at present (after this frame's round trip)
     }
     g_targetStats.clear();
     g_targetOrder = 0;
-    g_motionTarget = 0;
+    g_replayed.clear();
     g_objStats.motionDraws = g_objStats.maskDraws = g_objStats.skipped = 0;
     g_objStats.cpuMs = 0;
     g_objWritten = g_maskWritten = false;

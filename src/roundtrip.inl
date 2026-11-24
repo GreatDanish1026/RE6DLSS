@@ -251,7 +251,10 @@ bool Drain() {
     return true;
 }
 
+void FlushMotion(IDirect3DDevice9* dev);  // objects.inl: draw the batched motion replays
+
 void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
+    FlushMotion(g_d9);
     LARGE_INTEGER t0, t1, t2, f;
     QueryPerformanceCounter(&t0);
     D3DSURFACE_DESC d;
