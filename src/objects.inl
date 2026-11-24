@@ -866,18 +866,21 @@ void NativeRoundTrip(IDirect3DDevice9* dev) {
 
 void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, TargetStats*& ts);
 
-// Everything the add-on does before a game draw.
-void BeforeDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib) {
+// Everything the add-on does before a game draw. `up`: DrawPrimitiveUP / DrawIndexedPrimitiveUP
+// (vertices from memory: full-screen quads such as the tonemap pass; never replayed).
+void BeforeDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, bool up = false) {
     LARGE_INTEGER t0, t1, f;
     QueryPerformanceCounter(&t0);
     if (g_resync) Resync(dev);
     PollPipeline();
     if (g_psTonemap && !g_pastTonemap) {
+        static int logged = 0;
+        if (logged++ < 2) Log("objects: tonemap draw (%s%s)", up ? "UP " : "", d.indexed ? "indexed" : "non-indexed");
         NativeRoundTrip(dev);
         g_pastTonemap = true;
     }
     NativeJitter(dev);
-    if (!g_pastTonemap && g_bbWidth && ObjectsActive()) {
+    if (!up && !g_pastTonemap && g_bbWidth && ObjectsActive()) {
         const uint32_t motion0 = g_objStats.motionDraws, mask0 = g_objStats.maskDraws;
         TargetStats* ts = nullptr;
         OnSceneDrawImpl(dev, d, ib, ts);
@@ -978,6 +981,31 @@ HRESULT STDMETHODCALLTYPE HookDp(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, U
     return hr;
 }
 
+using DpUpFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+using DipUpFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT,
+                                            const void*, UINT);
+DpUpFn g_dpUp = nullptr, g_dpUpFirst = nullptr;
+DipUpFn g_dipUp = nullptr, g_dipUpFirst = nullptr;
+
+HRESULT STDMETHODCALLTYPE HookDpUp(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, UINT prims, const void* data, UINT stride) {
+    if (g_inDrawHook) return g_dpUpFirst(dev, type, prims, data, stride);
+    g_inDrawHook = true;
+    BeforeDraw(dev, DrawArgs{false, type, 0, 0, 0, 0, prims}, 0, true);
+    const HRESULT hr = g_dpUp(dev, type, prims, data, stride);
+    g_inDrawHook = false;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookDipUp(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, UINT minV, UINT numV, UINT prims,
+                                    const void* idx, D3DFORMAT fmt, const void* data, UINT stride) {
+    if (g_inDrawHook) return g_dipUpFirst(dev, type, minV, numV, prims, idx, fmt, data, stride);
+    g_inDrawHook = true;
+    BeforeDraw(dev, DrawArgs{true, type, 0, minV, numV, 0, prims}, 0, true);
+    const HRESULT hr = g_dipUp(dev, type, minV, numV, prims, idx, fmt, data, stride);
+    g_inDrawHook = false;
+    return hr;
+}
+
 std::string ModuleOf(const void* p) {
     HMODULE m = nullptr;
     char name[MAX_PATH] = "?";
@@ -1007,6 +1035,8 @@ void HookDraws(IDirect3DDevice9* dev) {
     bool any = false;
     any |= HookSlot<DpFn>(vt, 81, &HookDp, g_dp, g_dpFirst);
     any |= HookSlot<DipFn>(vt, 82, &HookDip, g_dip, g_dipFirst);
+    any |= HookSlot<DpUpFn>(vt, 83, &HookDpUp, g_dpUp, g_dpUpFirst);
+    any |= HookSlot<DipUpFn>(vt, 84, &HookDipUp, g_dipUp, g_dipUpFirst);
     any |= HookSlot<SetRtFn>(vt, 37, &HookSetRt, g_setRt, g_setRtFirst);
     any |= HookSlot<SetVsFn>(vt, 92, &HookSetVs, g_setVs, g_setVsFirst);
     any |= HookSlot<SetVsFFn>(vt, 94, &HookSetVsF, g_setVsF, g_setVsFFirst);
