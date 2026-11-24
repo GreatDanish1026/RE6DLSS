@@ -19,11 +19,17 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
+
+#include <dxgi.h>
+#include <timeapi.h>
+
+#pragma comment(lib, "winmm.lib")
 
 #include "common.hpp"
 #include "dlss.hpp"
@@ -120,6 +126,7 @@ struct Gpu {
     ID3D11PixelShader *invert = nullptr, *decode = nullptr, *motion = nullptr, *sanitize = nullptr;
     ID3D11Buffer* cb = nullptr;
     ID3D11Query* query = nullptr;
+    ID3D11Query *disjoint = nullptr, *ts[4] = {};  // GPU timing: start, after prep passes, after DLSS, end
     // shared (opened from the add-on's D3D9Ex handles)
     ID3D11Texture2D *in = nullptr, *out = nullptr, *depthPacked = nullptr;
     ID3D11ShaderResourceView *inSrv = nullptr, *depthPackedSrv = nullptr;
@@ -278,6 +285,7 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
     FullScreen(g, g.depthRtv, g.decode, &g.depthPackedSrv, 1);
     ID3D11ShaderResourceView* motionSrvs[2] = {g.inSrv, g.depthSrv};  // depth at t1
     FullScreen(g, g.mvRtv, g.motion, motionSrvs, 2);
+    if (g.ts[1]) g.ctx->End(g.ts[1]);
 
     dlss::Inputs in;
     in.color = g.color;  // sanitized copy of the scene
@@ -297,23 +305,62 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
         g.ctx->CopyResource(g.out, g.in);
         return;
     }
+    if (g.ts[2]) g.ctx->End(g.ts[2]);
     g.ctx->CopyResource(g.out, g.dlssOut);
     snprintf(ctl->helperStatus, sizeof(ctl->helperStatus), "DLSS %s", dlss::Status().c_str());
 }
 
+struct Timing {  // sums over the log interval
+    double wall = 0, queue = 0, prep = 0, dlss = 0, copy = 0, maxWall = 0;
+    uint32_t frames = 0, timed = 0;
+} g_timing;
+
 void Process(Gpu& g, SharedControl* ctl) {
     LARGE_INTEGER t0, t1, f;
     QueryPerformanceCounter(&t0);
+    const bool timed = g.disjoint && ctl->mode == kModeDlaa && g.dlssOk;
+    if (timed) {
+        g.ctx->Begin(g.disjoint);
+        g.ctx->End(g.ts[0]);
+    }
     if (ctl->mode == kModeInvert) FullScreen(g, g.outRtv, g.invert, &g.inSrv, 1);
     else if (ctl->mode == kModeDlaa) Dlaa(g, ctl);
     else g.ctx->CopyResource(g.out, g.in);
+    if (timed) {
+        g.ctx->End(g.ts[3]);
+        g.ctx->End(g.disjoint);
+    }
     g.ctx->End(g.query);
     g.ctx->Flush();
     while (g.ctx->GetData(g.query, nullptr, 0, 0) == S_FALSE) YieldProcessor();
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
-    ctl->helperGpuMs = static_cast<float>((t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
+    const double wall = (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+    ctl->helperGpuMs = static_cast<float>(wall);
     ++ctl->helperFrames;
+
+    // Where the time goes: GPU execution of each part vs. the wall time from submit to done
+    // (the rest is waiting for the GPU to get to this work).
+    Timing& t = g_timing;
+    t.wall += wall;
+    t.maxWall = (std::max)(t.maxWall, wall);
+    ++t.frames;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+    UINT64 ts[4] = {};
+    bool ok = timed && g.ctx->GetData(g.disjoint, &dj, sizeof(dj), 0) == S_OK && !dj.Disjoint && dj.Frequency;
+    for (int i = 0; ok && i < 4; ++i) ok = g.ctx->GetData(g.ts[i], &ts[i], sizeof(UINT64), 0) == S_OK;
+    if (ok && ts[1] >= ts[0] && ts[2] >= ts[1] && ts[3] >= ts[2]) {
+        const double k = 1000.0 / static_cast<double>(dj.Frequency);
+        t.prep += (ts[1] - ts[0]) * k, t.dlss += (ts[2] - ts[1]) * k, t.copy += (ts[3] - ts[2]) * k;
+        t.queue += wall - (ts[3] - ts[0]) * k;
+        ++t.timed;
+    }
+    if (t.frames >= 300) {
+        const double n = t.timed ? t.timed : 1;
+        Log("last %u frames: wall %.2f ms avg (max %.2f); GPU: prep passes %.2f, DLSS %.2f, copy %.2f; waiting for the GPU %.2f (%u timed)",
+            t.frames, t.wall / t.frames, t.maxWall, t.prep / n, t.dlss / n, t.copy / n, t.queue / n, t.timed);
+        t = Timing{};
+    }
 }
 
 }  // namespace
@@ -328,6 +375,25 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmd, int) {
     rd::g_dir = dir;
     rd::g_log = _wfopen((dir + L"RE6DLSS-helper64.log").c_str(), L"w");
     Log("RE6DLSS-helper64 started for game pid %lu", pid);
+
+    // The game waits for this process every frame, so it must wake and run at once. Windows 11
+    // treats a window-less background process as low priority: power throttling (EcoQoS, slower
+    // cores) and the default 15.6 ms timer, which showed up as ~16-18 ms stalls on random frames.
+    {
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+        PROCESS_POWER_THROTTLING_STATE pt = {};
+        pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        pt.StateMask = 0;  // throttling off for both
+        const BOOL noThrottle = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt));
+        const MMRESULT timer = timeBeginPeriod(1);
+        const BOOL prio = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        Log("scheduling: power throttling off %s, 1 ms timer %s, high priority %s", noThrottle ? "yes" : "no",
+            timer == TIMERR_NOERROR ? "yes" : "no", prio ? "yes" : "no");
+    }
 
     HANDLE game = OpenProcess(SYNCHRONIZE, FALSE, pid);
     char name[64];
@@ -349,6 +415,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmd, int) {
                                    nullptr, &g.ctx);
     D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
     if (SUCCEEDED(hr)) hr = g.dev->CreateQuery(&qd, &g.query);
+    if (SUCCEEDED(hr)) {  // optional GPU timing
+        D3D11_QUERY_DESC dq = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0}, tq = {D3D11_QUERY_TIMESTAMP, 0};
+        bool ok = SUCCEEDED(g.dev->CreateQuery(&dq, &g.disjoint));
+        for (auto*& q : g.ts) ok = ok && SUCCEEDED(g.dev->CreateQuery(&tq, &q));
+        if (!ok) Release(g.disjoint);
+    }
     if (FAILED(hr) || !Compile(g)) {
         ctl->helperError = hr;
         snprintf(ctl->helperStatus, sizeof(ctl->helperStatus), "helper: D3D11 setup failed 0x%08lx", hr);
@@ -357,6 +429,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmd, int) {
     }
     snprintf(ctl->helperStatus, sizeof(ctl->helperStatus), "helper: running");
     Log("D3D11 device ready");
+    {  // GPU side: the helper's work should not queue behind other processes' work
+        IDXGIDevice* dxgi = nullptr;
+        if (SUCCEEDED(g.dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgi)))) {
+            const HRESULT ph = dxgi->SetGPUThreadPriority(7);
+            Log("GPU thread priority 7: 0x%08lx", ph);
+            dxgi->Release();
+        }
+    }
     {  // start NGX now, so problems show up at once (not at the first DLAA frame)
         std::string err;
         g.dlssTried = true;
