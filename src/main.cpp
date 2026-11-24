@@ -24,11 +24,14 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <d3dcompiler.h>
 
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdarg>
 #include <cmath>
@@ -479,6 +482,7 @@ Stage* StageOf(Context& c, shader_stage s) {
 
 #include "jitter.inl"
 #include "roundtrip.inl"
+#include "objects.inl"
 
 void MarkTonemap(command_list* cl) {  // the tonemap draw ends the scene phase (jitter)
     if (g_pastTonemap) return;
@@ -497,6 +501,7 @@ void OnInitDevice(device* dev) {
     Log("device: D3D9 %p, IDirect3DDevice9Ex: %s (hr 0x%08lx)", d9, SUCCEEDED(hr) && ex ? "yes" : "no", hr);
     if (ex) {
         g_d9 = ex;  // kept for the device's lifetime (round trip)
+        HookDraws(d9);
         g_noEx = false;
         ex->Release();
     } else {
@@ -941,6 +946,7 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
     ++g_presents;
     g_rtDoneThisFrame = false;
     g_depthRes = {0};
+    ObjectsFrameEnd();
     NextJitter();
     if (!g_immediate) {
         g_immediate = q->get_native();
@@ -1008,15 +1014,23 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "CaptureHotkey", g_captureHotkey);
     reshade::get_config_value(nullptr, RD_PRODUCT, "AntiAliasing", g_aa);
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssModel", g_model);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "ObjectMotion", g_objMotionOn);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "EffectMask", g_effectMaskOn);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "LowLatency", g_asyncOn);
     if (g_aa < 0 || g_aa > 1) g_aa = 1;
     if (g_model < 0 || g_model > 4) g_model = 0;
     ApplySettings();
-    Log("settings: anti-aliasing %s, DLSS model %s", g_aa ? "DLAA" : "off", kModels[g_model]);
+    Log("settings: anti-aliasing %s, DLSS model %s, character motion %s, effect mask %s, low-latency hand-off %s",
+        g_aa ? "DLAA" : "off", kModels[g_model], g_objMotionOn ? "on" : "off", g_effectMaskOn ? "on" : "off",
+        g_asyncOn ? "on" : "off");
 }
 
 void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "AntiAliasing", g_aa);
     reshade::set_config_value(nullptr, RD_PRODUCT, "DlssModel", g_model);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "ObjectMotion", g_objMotionOn);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "EffectMask", g_effectMaskOn);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "LowLatency", g_asyncOn);
     ApplySettings();
 }
 
@@ -1044,6 +1058,18 @@ void DrawOverlay(effect_runtime*) {
     if (ImGui::Combo("DLSS model", &g_model, kModels, 5)) SaveSettings();
     Help("Automatic: the model NVIDIA recommends (K for DLAA). The NVIDIA app's DLSS override, if set for "
          "this game, takes precedence.");
+    if (ImGui::Checkbox("Character motion", &g_objMotionOn)) SaveSettings();
+    Help("Gives DLAA the movement of characters, enemies and moving objects (not only the camera's), so they "
+         "stay sharp without trails. Costs a little GPU time per character.");
+    if (ImGui::Checkbox("Effect mask", &g_effectMaskOn)) SaveSettings();
+    Help("Tells DLAA not to carry fire, smoke, sparks and other see-through effects over from earlier frames, "
+         "so they don't smear.");
+    if (ImGui::Checkbox("Low-latency hand-off", &g_asyncOn)) SaveSettings();
+    Help("The game doesn't wait for the GPU while DLAA runs, so the CPU and GPU stay busy (higher frame rate). "
+         "Relies on Windows keeping the two processes' GPU work in order; checked once a second, and switched "
+         "off by itself if that ever fails.");
+    if (g_asyncBroken)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Low-latency hand-off switched off: the order check failed on this system.");
     ImGui::EndDisabled();
 
     const ImVec4 warn(1.0f, 0.75f, 0.3f, 1.0f);
@@ -1060,6 +1086,12 @@ void DrawOverlay(effect_runtime*) {
     static const char* const kTest[] = {"Off (normal)", "Copy (picture unchanged)", "Invert (picture inverted)"};
     if (ImGui::Combo("Helper round trip test", &g_debugRoundTrip, kTest, 3)) ApplySettings();
     if (ImGui::Checkbox("Jitter test (16x, the picture shakes)", &g_jitterTest)) ApplySettings();
+    static const char* const kViews[] = {"Off (normal)", "Motion vectors", "Effect mask"};
+    ImGui::Combo("Debug view", &g_debugView, kViews, 3);
+    ImGui::TextDisabled("low-latency order checks: %u passed, %u failed", g_asyncOk, g_asyncStale);
+    ImGui::TextDisabled("objects last frame: %u motion draws, %u mask draws; vertex shaders patched %u, failed %u; %s",
+                        g_objStatsLast.motionDraws, g_objStatsLast.maskDraws, g_objStatsLast.patched,
+                        g_objStatsLast.failedPatch, g_objStatus.c_str());
     ImGui::TextDisabled("jitter %.3f, %.3f px; %u scene draws jittered last frame; camera matrix %s", g_jitterX,
                         g_jitterY, g_jitteredDrawsLast, g_havePrevVp ? "tracked" : "not seen");
     ImGui::BeginDisabled(g_capture.load() != Capture::Idle);

@@ -70,10 +70,12 @@ cbuffer Frame : register(b0) {
     row_major float4x4 curVp;          // world -> clip, unjittered
     row_major float4x4 prevVp;         // last frame's, unjittered
     float2 size;                       // pixels
-    float2 pad;
+    float useObjects;                  // 1: the add-on's object motion (objTex.rg where objTex.b = 1) wins
+    float pad;
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> depthTex : register(t1);
+Texture2D<float4> objTex : register(t2);  // object motion (rg, b = valid) and effect mask (a), from the add-on
 
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -88,6 +90,10 @@ float decode(float4 pos : SV_Position) : SV_Target {
     return dot(p, float3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
 }
 float2 motion(float4 pos : SV_Position) : SV_Target {
+    if (useObjects > 0.5) {
+        float4 o = objTex.Load(int3(pos.xy, 0));
+        if (o.b > 0.5 && all(abs(o.rg) <= size) && !any(isnan(o.rg))) return o.rg;
+    }
     float z = saturate(depthTex.Load(int3(pos.xy, 0)));
     float2 ndc = float2(pos.x / size.x * 2 - 1, 1 - pos.y / size.y * 2);
     float4 world = mul(float4(ndc, z, 1), invJitteredVp);
@@ -101,6 +107,22 @@ float2 motion(float4 pos : SV_Position) : SV_Target {
     // Invalid or off-screen-sized motion (camera cuts, near-plane extremes) -> none.
     if (any(isnan(mv)) || any(isinf(mv)) || any(abs(mv) > size)) return 0;
     return mv;
+}
+// Effect mask for DLSS (bias towards this frame's colour).
+float mask(float4 pos : SV_Position) : SV_Target {
+    float a = objTex.Load(int3(pos.xy, 0)).a;
+    return isnan(a) ? 0 : saturate(a);
+}
+// Developer views, shown instead of the picture: motion vectors (red/green = x/y, blue = object
+// motion from the add-on) or the effect mask.
+float4 debugMotion(float4 pos : SV_Position) : SV_Target {
+    float2 mv = src.Load(int3(pos.xy, 0)).rg;
+    float obj = objTex.Load(int3(pos.xy, 0)).b > 0.5 ? 0.6 : 0;
+    return float4(saturate(abs(mv) / 16.0), obj, 1);
+}
+float4 debugMask(float4 pos : SV_Position) : SV_Target {
+    float a = saturate(objTex.Load(int3(pos.xy, 0)).a);
+    return float4(a, a, a, 1);
 }
 // Colour as DLSS gets it: NaN, infinite or negative values (the game's skin shading can produce
 // them in close-ups; its own tonemap hides them, but DLSS's history would spread them) -> 0.
@@ -116,7 +138,8 @@ struct FrameCb {
     float curVp[16];
     float prevVp[16];
     float size[2];
-    float pad[2];
+    float useObjects;
+    float pad;
 };
 
 struct Gpu {
@@ -124,19 +147,21 @@ struct Gpu {
     ID3D11DeviceContext* ctx = nullptr;
     ID3D11VertexShader* vs = nullptr;
     ID3D11PixelShader *invert = nullptr, *decode = nullptr, *motion = nullptr, *sanitize = nullptr;
+    ID3D11PixelShader *mask = nullptr, *debugMotion = nullptr, *debugMask = nullptr;
     ID3D11Buffer* cb = nullptr;
     ID3D11Query* query = nullptr;
     ID3D11Query *disjoint = nullptr, *ts[4] = {};  // GPU timing: start, after prep passes, after DLSS, end
     // shared (opened from the add-on's D3D9Ex handles)
-    ID3D11Texture2D *in = nullptr, *out = nullptr, *depthPacked = nullptr;
-    ID3D11ShaderResourceView *inSrv = nullptr, *depthPackedSrv = nullptr;
+    ID3D11Texture2D *in = nullptr, *out = nullptr, *depthPacked = nullptr, *obj = nullptr;
+    ID3D11ShaderResourceView *inSrv = nullptr, *depthPackedSrv = nullptr, *objSrv = nullptr;
     ID3D11RenderTargetView* outRtv = nullptr;
     // ours
-    ID3D11Texture2D *depth = nullptr, *mv = nullptr, *dlssOut = nullptr, *color = nullptr;
-    ID3D11ShaderResourceView* depthSrv = nullptr;
-    ID3D11RenderTargetView *depthRtv = nullptr, *mvRtv = nullptr, *colorRtv = nullptr;
+    ID3D11Texture2D *depth = nullptr, *mv = nullptr, *dlssOut = nullptr, *color = nullptr, *maskTex = nullptr;
+    ID3D11ShaderResourceView *depthSrv = nullptr, *mvSrv = nullptr;
+    ID3D11RenderTargetView *depthRtv = nullptr, *mvRtv = nullptr, *colorRtv = nullptr, *maskRtv = nullptr;
     uint32_t generation = 0, width = 0, height = 0;
     bool dlssTried = false, dlssOk = false;
+    bool timingPending = false;
 };
 
 template <typename T>
@@ -158,7 +183,8 @@ bool Compile(Gpu& g) {
     g.dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g.vs);
     Release(b);
     const struct { const char* e; ID3D11PixelShader** ps; } list[] = {
-        {"invert", &g.invert}, {"decode", &g.decode}, {"motion", &g.motion}, {"sanitize", &g.sanitize}};
+        {"invert", &g.invert}, {"decode", &g.decode}, {"motion", &g.motion}, {"sanitize", &g.sanitize},
+        {"mask", &g.mask}, {"debugMotion", &g.debugMotion}, {"debugMask", &g.debugMask}};
     for (const auto& s : list) {
         if (!one(s.e, "ps_5_0", &b)) return false;
         g.dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, s.ps);
@@ -166,12 +192,13 @@ bool Compile(Gpu& g) {
     }
     D3D11_BUFFER_DESC bd = {sizeof(FrameCb), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
     g.dev->CreateBuffer(&bd, nullptr, &g.cb);
-    return g.vs && g.invert && g.decode && g.motion && g.sanitize && g.cb;
+    return g.vs && g.invert && g.decode && g.motion && g.sanitize && g.mask && g.debugMotion && g.debugMask && g.cb;
 }
 
 void ReleaseTextures(Gpu& g) {
-    Release(g.inSrv), Release(g.depthPackedSrv), Release(g.outRtv);
-    Release(g.in), Release(g.out), Release(g.depthPacked);
+    Release(g.inSrv), Release(g.depthPackedSrv), Release(g.outRtv), Release(g.objSrv);
+    Release(g.in), Release(g.out), Release(g.depthPacked), Release(g.obj);
+    Release(g.mvSrv), Release(g.maskRtv), Release(g.maskTex);
     Release(g.depthSrv), Release(g.depthRtv), Release(g.mvRtv), Release(g.colorRtv);
     Release(g.depth), Release(g.mv), Release(g.dlssOut), Release(g.color);
 }
@@ -189,6 +216,10 @@ HRESULT OpenTextures(Gpu& g, SharedControl* ctl) {
     if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(g.in, nullptr, &g.inSrv);
     if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(g.depthPacked, nullptr, &g.depthPackedSrv);
     if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.out, nullptr, &g.outRtv);
+    if (SUCCEEDED(hr) && ctl->objHandle) {  // optional: older add-on builds don't send it
+        if (SUCCEEDED(OpenShared(g, ctl->objHandle, &g.obj))) g.dev->CreateShaderResourceView(g.obj, nullptr, &g.objSrv);
+        else Log("couldn't open the object texture; object motion and effect mask off");
+    }
     if (FAILED(hr)) return hr;
     D3D11_TEXTURE2D_DESC d;
     g.in->GetDesc(&d);
@@ -205,6 +236,9 @@ HRESULT OpenTextures(Gpu& g, SharedControl* ctl) {
     if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(g.depth, nullptr, &g.depthSrv);
     if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.depth, nullptr, &g.depthRtv);
     if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.mv, nullptr, &g.mvRtv);
+    if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(g.mv, nullptr, &g.mvSrv);
+    if (SUCCEEDED(hr)) hr = make(DXGI_FORMAT_R8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &g.maskTex);
+    if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.maskTex, nullptr, &g.maskRtv);
     if (FAILED(hr)) return hr;
     Log("opened shared textures: %ux%u format %u (generation %u)", d.Width, d.Height, d.Format, ctl->generation);
     g.generation = ctl->generation;
@@ -222,8 +256,8 @@ void FullScreen(Gpu& g, ID3D11RenderTargetView* rtv, ID3D11PixelShader* ps, ID3D
     g.ctx->PSSetConstantBuffers(0, 1, &g.cb);
     g.ctx->PSSetShaderResources(0, nsrv, srvs);
     g.ctx->Draw(3, 0);
-    ID3D11ShaderResourceView* none[2] = {};
-    g.ctx->PSSetShaderResources(0, 2, none);
+    ID3D11ShaderResourceView* none[3] = {};
+    g.ctx->PSSetShaderResources(0, 3, none);
     g.ctx->OMSetRenderTargets(0, nullptr, nullptr);
 }
 
@@ -279,12 +313,19 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
     memcpy(cb.curVp, ctl->viewProj, sizeof(cb.curVp));
     memcpy(cb.prevVp, ctl->havePrev ? ctl->prevViewProj : ctl->viewProj, sizeof(cb.prevVp));
     cb.size[0] = static_cast<float>(g.width), cb.size[1] = static_cast<float>(g.height);
+    const bool objects = g.objSrv && (ctl->objFlags & kObjMotion);
+    const bool masked = g.objSrv && (ctl->objFlags & kObjMask);
+    cb.useObjects = objects ? 1.0f : 0.0f;
     g.ctx->UpdateSubresource(g.cb, 0, nullptr, &cb, 0, 0);
 
     FullScreen(g, g.colorRtv, g.sanitize, &g.inSrv, 1);
     FullScreen(g, g.depthRtv, g.decode, &g.depthPackedSrv, 1);
-    ID3D11ShaderResourceView* motionSrvs[2] = {g.inSrv, g.depthSrv};  // depth at t1
-    FullScreen(g, g.mvRtv, g.motion, motionSrvs, 2);
+    ID3D11ShaderResourceView* motionSrvs[3] = {g.inSrv, g.depthSrv, g.objSrv};  // depth at t1, objects at t2
+    FullScreen(g, g.mvRtv, g.motion, motionSrvs, 3);
+    if (masked) {
+        ID3D11ShaderResourceView* maskSrvs[3] = {nullptr, nullptr, g.objSrv};
+        FullScreen(g, g.maskRtv, g.mask, maskSrvs, 3);
+    }
     if (g.ts[1]) g.ctx->End(g.ts[1]);
 
     dlss::Inputs in;
@@ -299,6 +340,7 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
     in.reset = ctl->reset != 0 || !ctl->havePrev;
     in.preset = ctl->preset;
     in.depthInverted = false;
+    in.biasMask = masked ? g.maskTex : nullptr;
     std::string err;
     if (!dlss::Evaluate(g.ctx, in, err)) {
         snprintf(ctl->helperStatus, sizeof(ctl->helperStatus), "DLSS: %s", err.c_str());
@@ -307,6 +349,13 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
     }
     if (g.ts[2]) g.ctx->End(g.ts[2]);
     g.ctx->CopyResource(g.out, g.dlssOut);
+    if (ctl->debugView == 1) {
+        ID3D11ShaderResourceView* srvs[3] = {g.mvSrv, nullptr, g.objSrv};
+        FullScreen(g, g.outRtv, g.debugMotion, srvs, 3);
+    } else if (ctl->debugView == 2 && g.objSrv) {
+        ID3D11ShaderResourceView* srvs[3] = {nullptr, nullptr, g.objSrv};
+        FullScreen(g, g.outRtv, g.debugMask, srvs, 3);
+    }
     snprintf(ctl->helperStatus, sizeof(ctl->helperStatus), "DLSS %s", dlss::Status().c_str());
 }
 
@@ -315,9 +364,31 @@ struct Timing {  // sums over the log interval
     uint32_t frames = 0, timed = 0;
 } g_timing;
 
+// GPU time of each part, from the timestamp queries (false if not available yet).
+bool ReadTimestamps(Gpu& g, double& prep, double& dlss, double& copy, double& total) {
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+    UINT64 ts[4] = {};
+    const UINT flags = D3D11_ASYNC_GETDATA_DONOTFLUSH;
+    bool ok = g.ctx->GetData(g.disjoint, &dj, sizeof(dj), flags) == S_OK && !dj.Disjoint && dj.Frequency;
+    for (int i = 0; ok && i < 4; ++i) ok = g.ctx->GetData(g.ts[i], &ts[i], sizeof(UINT64), flags) == S_OK;
+    if (!ok || ts[1] < ts[0] || ts[2] < ts[1] || ts[3] < ts[2]) return false;
+    const double k = 1000.0 / static_cast<double>(dj.Frequency);
+    prep = (ts[1] - ts[0]) * k, dlss = (ts[2] - ts[1]) * k, copy = (ts[3] - ts[2]) * k, total = (ts[3] - ts[0]) * k;
+    return true;
+}
+
+// One frame. Normal hand-off: answer when the GPU has finished. Low-latency (ctl->async): answer
+// as soon as the work is submitted; the OS runs the GPU work of the two processes in submission
+// order, so the game's copy back (submitted after our answer) follows it.
 void Process(Gpu& g, SharedControl* ctl) {
     LARGE_INTEGER t0, t1, f;
     QueryPerformanceCounter(&t0);
+    Timing& t = g_timing;
+    double prep, dlssMs, copy, gpu;
+    if (g.timingPending) {  // last frame's timestamps (low-latency: read one frame later)
+        g.timingPending = false;
+        if (ReadTimestamps(g, prep, dlssMs, copy, gpu)) t.prep += prep, t.dlss += dlssMs, t.copy += copy, ++t.timed;
+    }
     const bool timed = g.disjoint && ctl->mode == kModeDlaa && g.dlssOk;
     if (timed) {
         g.ctx->Begin(g.disjoint);
@@ -326,39 +397,42 @@ void Process(Gpu& g, SharedControl* ctl) {
     if (ctl->mode == kModeInvert) FullScreen(g, g.outRtv, g.invert, &g.inSrv, 1);
     else if (ctl->mode == kModeDlaa) Dlaa(g, ctl);
     else g.ctx->CopyResource(g.out, g.in);
+    if (ctl->checkMarker) {  // order check: the input's top-left pixel goes to the output unchanged
+        const D3D11_BOX box = {0, 0, 0, 1, 1, 1};
+        g.ctx->CopySubresourceRegion(g.out, 0, 0, 0, 0, g.in, 0, &box);
+    }
     if (timed) {
         g.ctx->End(g.ts[3]);
         g.ctx->End(g.disjoint);
     }
     g.ctx->End(g.query);
     g.ctx->Flush();
-    while (g.ctx->GetData(g.query, nullptr, 0, 0) == S_FALSE) YieldProcessor();
+    const bool async = ctl->async != 0;
+    if (!async)
+        while (g.ctx->GetData(g.query, nullptr, 0, 0) == S_FALSE) YieldProcessor();
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
     const double wall = (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
     ctl->helperGpuMs = static_cast<float>(wall);
     ++ctl->helperFrames;
 
-    // Where the time goes: GPU execution of each part vs. the wall time from submit to done
-    // (the rest is waiting for the GPU to get to this work).
-    Timing& t = g_timing;
     t.wall += wall;
     t.maxWall = (std::max)(t.maxWall, wall);
     ++t.frames;
-    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
-    UINT64 ts[4] = {};
-    bool ok = timed && g.ctx->GetData(g.disjoint, &dj, sizeof(dj), 0) == S_OK && !dj.Disjoint && dj.Frequency;
-    for (int i = 0; ok && i < 4; ++i) ok = g.ctx->GetData(g.ts[i], &ts[i], sizeof(UINT64), 0) == S_OK;
-    if (ok && ts[1] >= ts[0] && ts[2] >= ts[1] && ts[3] >= ts[2]) {
-        const double k = 1000.0 / static_cast<double>(dj.Frequency);
-        t.prep += (ts[1] - ts[0]) * k, t.dlss += (ts[2] - ts[1]) * k, t.copy += (ts[3] - ts[2]) * k;
-        t.queue += wall - (ts[3] - ts[0]) * k;
+    if (timed && async) {
+        g.timingPending = true;
+    } else if (timed && ReadTimestamps(g, prep, dlssMs, copy, gpu)) {
+        t.prep += prep, t.dlss += dlssMs, t.copy += copy, t.queue += wall - gpu;
         ++t.timed;
     }
     if (t.frames >= 300) {
         const double n = t.timed ? t.timed : 1;
-        Log("last %u frames: wall %.2f ms avg (max %.2f); GPU: prep passes %.2f, DLSS %.2f, copy %.2f; waiting for the GPU %.2f (%u timed)",
-            t.frames, t.wall / t.frames, t.maxWall, t.prep / n, t.dlss / n, t.copy / n, t.queue / n, t.timed);
+        if (async)
+            Log("last %u frames (low-latency): submit %.2f ms avg (max %.2f); GPU: prep passes %.2f, DLSS %.2f, copy %.2f (%u timed)",
+                t.frames, t.wall / t.frames, t.maxWall, t.prep / n, t.dlss / n, t.copy / n, t.timed);
+        else
+            Log("last %u frames: wall %.2f ms avg (max %.2f); GPU: prep passes %.2f, DLSS %.2f, copy %.2f; waiting for the GPU %.2f (%u timed)",
+                t.frames, t.wall / t.frames, t.maxWall, t.prep / n, t.dlss / n, t.copy / n, t.queue / n, t.timed);
         t = Timing{};
     }
 }
