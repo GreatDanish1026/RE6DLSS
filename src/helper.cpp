@@ -82,14 +82,26 @@ float decode(float4 pos : SV_Position) : SV_Target {
     return dot(p, float3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
 }
 float2 motion(float4 pos : SV_Position) : SV_Target {
-    float z = depthTex.Load(int3(pos.xy, 0));
+    float z = saturate(depthTex.Load(int3(pos.xy, 0)));
     float2 ndc = float2(pos.x / size.x * 2 - 1, 1 - pos.y / size.y * 2);
     float4 world = mul(float4(ndc, z, 1), invJitteredVp);
+    if (abs(world.w) < 1e-8) return 0;
     world /= world.w;
     float4 cur = mul(world, curVp);
     float4 prev = mul(world, prevVp);
+    if (cur.w <= 1e-6 || prev.w <= 1e-6) return 0;  // behind the camera in either frame
     float2 curNdc = cur.xy / cur.w, prevNdc = prev.xy / prev.w;
-    return (prevNdc - curNdc) * float2(0.5, -0.5) * size;
+    float2 mv = (prevNdc - curNdc) * float2(0.5, -0.5) * size;
+    // Invalid or off-screen-sized motion (camera cuts, near-plane extremes) -> none.
+    if (any(isnan(mv)) || any(isinf(mv)) || any(abs(mv) > size)) return 0;
+    return mv;
+}
+// Colour as DLSS gets it: NaN, infinite or negative values (the game's skin shading can produce
+// them in close-ups; its own tonemap hides them, but DLSS's history would spread them) -> 0.
+float4 sanitize(float4 pos : SV_Position) : SV_Target {
+    float4 c = src.Load(int3(pos.xy, 0));
+    if (any(isnan(c)) || any(isinf(c))) c = 0;
+    return float4(clamp(c.rgb, 0, 65000), saturate(c.a));
 }
 )";
 
@@ -105,7 +117,7 @@ struct Gpu {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     ID3D11VertexShader* vs = nullptr;
-    ID3D11PixelShader *invert = nullptr, *decode = nullptr, *motion = nullptr;
+    ID3D11PixelShader *invert = nullptr, *decode = nullptr, *motion = nullptr, *sanitize = nullptr;
     ID3D11Buffer* cb = nullptr;
     ID3D11Query* query = nullptr;
     // shared (opened from the add-on's D3D9Ex handles)
@@ -113,9 +125,9 @@ struct Gpu {
     ID3D11ShaderResourceView *inSrv = nullptr, *depthPackedSrv = nullptr;
     ID3D11RenderTargetView* outRtv = nullptr;
     // ours
-    ID3D11Texture2D *depth = nullptr, *mv = nullptr, *dlssOut = nullptr;
+    ID3D11Texture2D *depth = nullptr, *mv = nullptr, *dlssOut = nullptr, *color = nullptr;
     ID3D11ShaderResourceView* depthSrv = nullptr;
-    ID3D11RenderTargetView *depthRtv = nullptr, *mvRtv = nullptr;
+    ID3D11RenderTargetView *depthRtv = nullptr, *mvRtv = nullptr, *colorRtv = nullptr;
     uint32_t generation = 0, width = 0, height = 0;
     bool dlssTried = false, dlssOk = false;
 };
@@ -138,7 +150,8 @@ bool Compile(Gpu& g) {
     if (!one("vs", "vs_5_0", &b)) return false;
     g.dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g.vs);
     Release(b);
-    const struct { const char* e; ID3D11PixelShader** ps; } list[] = {{"invert", &g.invert}, {"decode", &g.decode}, {"motion", &g.motion}};
+    const struct { const char* e; ID3D11PixelShader** ps; } list[] = {
+        {"invert", &g.invert}, {"decode", &g.decode}, {"motion", &g.motion}, {"sanitize", &g.sanitize}};
     for (const auto& s : list) {
         if (!one(s.e, "ps_5_0", &b)) return false;
         g.dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, s.ps);
@@ -146,14 +159,14 @@ bool Compile(Gpu& g) {
     }
     D3D11_BUFFER_DESC bd = {sizeof(FrameCb), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
     g.dev->CreateBuffer(&bd, nullptr, &g.cb);
-    return g.vs && g.invert && g.decode && g.motion && g.cb;
+    return g.vs && g.invert && g.decode && g.motion && g.sanitize && g.cb;
 }
 
 void ReleaseTextures(Gpu& g) {
     Release(g.inSrv), Release(g.depthPackedSrv), Release(g.outRtv);
     Release(g.in), Release(g.out), Release(g.depthPacked);
-    Release(g.depthSrv), Release(g.depthRtv), Release(g.mvRtv);
-    Release(g.depth), Release(g.mv), Release(g.dlssOut);
+    Release(g.depthSrv), Release(g.depthRtv), Release(g.mvRtv), Release(g.colorRtv);
+    Release(g.depth), Release(g.mv), Release(g.dlssOut), Release(g.color);
 }
 
 HRESULT OpenShared(Gpu& g, uint64_t handle, ID3D11Texture2D** tex) {
@@ -180,6 +193,8 @@ HRESULT OpenTextures(Gpu& g, SharedControl* ctl) {
     hr = make(DXGI_FORMAT_R32_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &g.depth);
     if (SUCCEEDED(hr)) hr = make(DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &g.mv);
     if (SUCCEEDED(hr)) hr = make(d.Format, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, &g.dlssOut);
+    if (SUCCEEDED(hr)) hr = make(d.Format, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, &g.color);
+    if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.color, nullptr, &g.colorRtv);
     if (SUCCEEDED(hr)) hr = g.dev->CreateShaderResourceView(g.depth, nullptr, &g.depthSrv);
     if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.depth, nullptr, &g.depthRtv);
     if (SUCCEEDED(hr)) hr = g.dev->CreateRenderTargetView(g.mv, nullptr, &g.mvRtv);
@@ -259,12 +274,13 @@ void Dlaa(Gpu& g, SharedControl* ctl) {
     cb.size[0] = static_cast<float>(g.width), cb.size[1] = static_cast<float>(g.height);
     g.ctx->UpdateSubresource(g.cb, 0, nullptr, &cb, 0, 0);
 
+    FullScreen(g, g.colorRtv, g.sanitize, &g.inSrv, 1);
     FullScreen(g, g.depthRtv, g.decode, &g.depthPackedSrv, 1);
     ID3D11ShaderResourceView* motionSrvs[2] = {g.inSrv, g.depthSrv};  // depth at t1
     FullScreen(g, g.mvRtv, g.motion, motionSrvs, 2);
 
     dlss::Inputs in;
-    in.color = g.in;
+    in.color = g.color;  // sanitized copy of the scene
     in.depth = g.depth;
     in.motion = g.mv;
     in.output = g.dlssOut;

@@ -109,6 +109,21 @@ bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt, D3DFORMAT depthFmt) {
     return true;
 }
 
+// A camera cut (cutscene shot change, teleport): the view-projection jumps. Rows 1-3 hold rotation
+// and projection (values around 0..3), row 4 the translation (scene units); a normal frame changes
+// them only a little. DLSS's history is dropped on a cut so the previous shot doesn't smear in.
+uint32_t g_cuts = 0;
+
+bool CameraCut(const float* cur, const float* prev) {
+    float rot = 0, trans = 0, scale = 1;
+    for (int i = 0; i < 12; ++i) rot = std::max(rot, std::fabs(cur[i] - prev[i]));
+    for (int i = 12; i < 16; ++i) {
+        trans = std::max(trans, std::fabs(cur[i] - prev[i]));
+        scale = std::max(scale, std::fabs(cur[i]));
+    }
+    return rot > 0.25f || trans > 0.25f * scale;
+}
+
 bool WaitGpu() {  // D3D9: event query, flushed, spun until the GPU is done (100 ms cap)
     g_query->Issue(D3DISSUE_END);
     const ULONGLONG until = GetTickCount64() + 100;
@@ -162,7 +177,9 @@ void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
         memcpy(g_ctl->viewProj, g_frameVp, sizeof(g_ctl->viewProj));
         memcpy(g_ctl->prevViewProj, g_prevVp, sizeof(g_ctl->prevViewProj));
         g_ctl->havePrev = g_havePrevVp ? 1 : 0;
-        g_ctl->reset = static_cast<int>(g_ctl->mode) != g_lastSentMode ? 1 : 0;
+        const bool cut = g_havePrevVp && CameraCut(g_frameVp, g_prevVp);
+        if (cut) ++g_cuts;
+        g_ctl->reset = static_cast<int>(g_ctl->mode) != g_lastSentMode || cut ? 1 : 0;
         g_ctl->preset = g_dlssPreset;
         g_lastSentMode = static_cast<int>(g_ctl->mode);
         QueryPerformanceCounter(&t1);
@@ -186,8 +203,8 @@ void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
             g_rtMsAvg = g_rtFrames ? g_rtMsAvg * 0.95 + total * 0.05 : total;
             g_rtWaitAvg = g_rtFrames ? g_rtWaitAvg * 0.95 + wait * 0.05 : wait;
             if (++g_rtFrames == 1 || g_rtFrames % 600 == 0)
-                Log("round trip %llu: %.2f ms total, %.2f ms helper (helper's own %.2f ms)",
-                    static_cast<unsigned long long>(g_rtFrames), total, wait, g_ctl->helperGpuMs);
+                Log("round trip %llu: %.2f ms total, %.2f ms helper (helper's own %.2f ms), %u camera cuts so far",
+                    static_cast<unsigned long long>(g_rtFrames), total, wait, g_ctl->helperGpuMs, g_cuts);
             g_rtStatus = Format("%s: %.2f ms per frame (helper %.2f ms). %s",
                                 g_rtMode == 3 ? (g_ctl->mode == kModeDlaa ? "DLAA" : "DLAA (waiting for the 3D scene)")
                                 : g_rtMode == 2 ? "Invert test" : "Copy test",
