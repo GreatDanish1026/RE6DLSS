@@ -658,66 +658,266 @@ void ReplayMask(IDirect3DDevice9* dev, const DrawArgs& d) {
     targets.Restore(dev);
 }
 
+// ---- native state tracking
+//
+// The game's render target, shaders and vertex shader constants are tracked as it sets them
+// (device vtable slots 37, 92, 94, 107), so a draw needs no queries: jitter, the tonemap round
+// trip and the object work all run from the draw hook. Our own state changes (replays, copies)
+// pass through untracked (g_inDrawHook) and are undone before returning. ReShade draws its overlay
+// with a state block, which restores state without these calls, so the first draw of each frame
+// reads the device state once (g_resync).
+
+struct RtInfo {
+    UINT w = 0, h = 0;
+    IDirect3DTexture9* tex = nullptr;  // compared only
+    D3DFORMAT fmt = D3DFMT_UNKNOWN;
+};
+std::unordered_map<uintptr_t, RtInfo> g_rtCache;
+
+using SetRtFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+using SetVsFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DVertexShader9*);
+using SetPsFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DPixelShader9*);
+using SetVsFFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, UINT, const float*, UINT);
+SetRtFn g_setRt = nullptr, g_setRtFirst = nullptr;
+SetVsFn g_setVs = nullptr, g_setVsFirst = nullptr;
+SetPsFn g_setPs = nullptr, g_setPsFirst = nullptr;
+SetVsFFn g_setVsF = nullptr, g_setVsFFirst = nullptr;
+bool g_inStateHook = false;
+
+IDirect3DSurface9* g_rt0 = nullptr;
+const RtInfo* g_rt0Info = nullptr;
+IDirect3DVertexShader9* g_vs = nullptr;
+ObjVs* g_vsObj = nullptr;
+IDirect3DPixelShader9* g_ps = nullptr;
+bool g_psTonemap = false;
+float g_vsF[256 * 4] = {};           // the game's vertex shader constants (without our jitter)
+int g_jitReg = -1;                   // our jittered fViewProj copy is on the device at this register
+bool g_jitDirty = false;             // the game partly overwrote it since
+bool g_resync = true;                // read the device state at the next draw
+IDirect3DTexture9* g_depthTexFrame = nullptr;  // this frame's pre-pass target (compared only)
+std::unordered_map<uintptr_t, bool> g_psIsTonemap;
+
+const RtInfo* RtInfoOf(IDirect3DSurface9* rt) {
+    if (!rt) return nullptr;
+    const uintptr_t id = reinterpret_cast<uintptr_t>(rt);
+    auto it = g_rtCache.find(id);
+    if (it != g_rtCache.end()) return &it->second;
+    RtInfo info;
+    D3DSURFACE_DESC rd = {};
+    rt->GetDesc(&rd);
+    info.w = rd.Width, info.h = rd.Height, info.fmt = rd.Format;
+    rt->GetContainer(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&info.tex));
+    if (info.tex) info.tex->Release();
+    if (g_rtCache.size() > 4096) g_rtCache.clear();
+    return &g_rtCache.emplace(id, info).first->second;
+}
+
+bool IsTonemapPs(IDirect3DPixelShader9* ps) {
+    if (!ps) return false;
+    auto it = g_psIsTonemap.find(reinterpret_cast<uintptr_t>(ps));
+    if (it != g_psIsTonemap.end()) return it->second;
+    UINT size = 0;
+    bool tonemap = false;
+    if (SUCCEEDED(ps->GetFunction(nullptr, &size)) && size && size < (1u << 20)) {
+        std::vector<uint8_t> code(size);
+        if (SUCCEEDED(ps->GetFunction(code.data(), &size))) tonemap = Fnv(code.data(), size) == kTonemapPs;
+    }
+    if (tonemap) Log("objects: tonemap pixel shader %p", ps);
+    return g_psIsTonemap[reinterpret_cast<uintptr_t>(ps)] = tonemap;
+}
+
+void TrackRt0(IDirect3DSurface9* rt) {
+    g_rt0 = rt;
+    g_rt0Info = RtInfoOf(rt);
+    if (g_rt0Info && !g_pastTonemap && !g_depthTexFrame && g_rt0Info->w == g_bbWidth && g_rt0Info->h == g_bbHeight &&
+        g_rt0Info->tex) {
+        g_depthTexFrame = g_rt0Info->tex;  // the frame's first back-buffer-sized target: its depth pre-pass
+        g_depthRes.handle = reinterpret_cast<uint64_t>(g_depthTexFrame);
+    }
+}
+
+void TrackVs(IDirect3DVertexShader9* vs) {
+    g_vs = vs;
+    g_vsObj = vs ? &ObjVsInfo(vs) : nullptr;
+}
+
+void Resync(IDirect3DDevice9* dev) {
+    g_resync = false;
+    IDirect3DSurface9* rt = nullptr;
+    dev->GetRenderTarget(0, &rt);
+    TrackRt0(rt);
+    if (rt) rt->Release();
+    IDirect3DVertexShader9* vs = nullptr;
+    dev->GetVertexShader(&vs);
+    TrackVs(vs);
+    if (vs) vs->Release();
+    IDirect3DPixelShader9* ps = nullptr;
+    dev->GetPixelShader(&ps);
+    g_ps = ps, g_psTonemap = IsTonemapPs(ps);
+    if (ps) ps->Release();
+    dev->GetVertexShaderConstantF(0, g_vsF, 256);
+    g_jitReg = -1, g_jitDirty = false;  // the device has the game's values (jitter undone at the tonemap)
+}
+
+HRESULT STDMETHODCALLTYPE HookSetRt(IDirect3DDevice9* dev, DWORD i, IDirect3DSurface9* rt) {
+    if (g_inStateHook) return g_setRtFirst(dev, i, rt);
+    if (!g_inDrawHook && i == 0) {
+        if (!g_batch.empty() && reinterpret_cast<uintptr_t>(rt) != g_batchTarget) {  // the batch's pass ends
+            g_inDrawHook = true;
+            FlushMotion(dev);
+            g_inDrawHook = false;
+        }
+        TrackRt0(rt);
+    }
+    g_inStateHook = true;
+    const HRESULT hr = g_setRt(dev, i, rt);
+    g_inStateHook = false;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookSetVs(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs) {
+    if (g_inStateHook) return g_setVsFirst(dev, vs);
+    if (!g_inDrawHook) TrackVs(vs);
+    g_inStateHook = true;
+    const HRESULT hr = g_setVs(dev, vs);
+    g_inStateHook = false;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookSetPs(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps) {
+    if (g_inStateHook) return g_setPsFirst(dev, ps);
+    if (!g_inDrawHook) g_ps = ps, g_psTonemap = IsTonemapPs(ps);
+    g_inStateHook = true;
+    const HRESULT hr = g_setPs(dev, ps);
+    g_inStateHook = false;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookSetVsF(IDirect3DDevice9* dev, UINT start, const float* data, UINT count) {
+    if (g_inStateHook) return g_setVsFFirst(dev, start, data, count);
+    if (!g_inDrawHook && data && start < 256) {
+        const UINT n = std::min(count, 256 - start);
+        memcpy(g_vsF + start * 4, data, n * 16);
+        if (g_jitReg >= 0 && start < static_cast<UINT>(g_jitReg) + 4 && start + n > static_cast<UINT>(g_jitReg)) {
+            if (start <= static_cast<UINT>(g_jitReg) && start + n >= static_cast<UINT>(g_jitReg) + 4) g_jitReg = -1;  // all of it
+            else g_jitDirty = true;
+        }
+    }
+    g_inStateHook = true;
+    const HRESULT hr = g_setVsF(dev, start, data, count);
+    g_inStateHook = false;
+    return hr;
+}
+
+void WriteVsF(IDirect3DDevice9* dev, UINT start, const float* data, UINT count) {  // ours: not tracked
+    g_inStateHook = true;
+    g_setVsF(dev, start, data, count);
+    g_inStateHook = false;
+}
+
+// Jitter (see jitter.inl): the draw's fViewProj, from the tracked game constants, with this frame's
+// offset; the game's values go back before any draw that doesn't use that register as fViewProj.
+void NativeJitter(IDirect3DDevice9* dev) {
+    const bool scene = g_rt0Info && g_rt0Info->w == g_bbWidth && g_rt0Info->h == g_bbHeight && !g_pastTonemap;
+    const int vpReg = scene && g_vsObj ? g_vsObj->vpReg : -1;
+    int applyReg = -1;
+    if (vpReg >= 0) {
+        const float* vp = g_vsF + vpReg * 4;
+        bool finite = true;
+        for (int i = 0; i < 16; ++i) finite = finite && std::isfinite(vp[i]);
+        if (finite && vp[15] != 0.0f) {
+            if (!g_haveFrameVp && LooksLikeViewProj(vp)) {  // the frame's camera, for motion vectors
+                memcpy(g_frameVp, vp, sizeof(g_frameVp));
+                g_haveFrameVp = true;
+            }
+            if (g_jitterMode) applyReg = vpReg;
+        }
+    }
+    if (g_jitReg >= 0 && g_jitReg != applyReg) {  // put the game's values back
+        WriteVsF(dev, static_cast<UINT>(g_jitReg), g_vsF + g_jitReg * 4, 4);
+        g_jitReg = -1, g_jitDirty = false;
+    }
+    if (applyReg < 0) return;
+    ++g_jitteredDraws;
+    if (g_jitReg == applyReg && !g_jitDirty) return;  // already on the device
+    float vp[16];
+    memcpy(vp, g_vsF + applyReg * 4, sizeof(vp));
+    const float jx = 2.0f * g_jitterX / g_bbWidth, jy = -2.0f * g_jitterY / g_bbHeight;
+    for (int r = 0; r < 4; ++r) {
+        vp[r * 4 + 0] += jx * vp[r * 4 + 3];
+        vp[r * 4 + 1] += jy * vp[r * 4 + 3];
+    }
+    WriteVsF(dev, static_cast<UINT>(applyReg), vp, 4);
+    g_jitReg = applyReg, g_jitDirty = false;
+}
+
+void NativeRoundTrip(IDirect3DDevice9* dev) {
+    if (!g_rtMode || g_rtFailed || g_rtDoneThisFrame || !g_d9) return;
+    IDirect3DBaseTexture9* bt = nullptr;
+    dev->GetTexture(0, &bt);  // the tonemap's input: the HDR scene
+    IDirect3DTexture9* tex = nullptr;
+    if (bt) bt->QueryInterface(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&tex)), bt->Release();
+    if (!tex) return;
+    g_rtDoneThisFrame = true;
+    g_sceneTexLast = tex;
+    RoundTrip(tex, g_depthTexFrame);
+    tex->Release();
+}
+
 void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, TargetStats*& ts);
 
-void OnSceneDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib) {
-    if (g_pastTonemap || !g_bbWidth || !ObjectsActive()) return;
+// Everything the add-on does before a game draw.
+void BeforeDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib) {
     LARGE_INTEGER t0, t1, f;
     QueryPerformanceCounter(&t0);
-    const uint32_t motion0 = g_objStats.motionDraws, mask0 = g_objStats.maskDraws;
-    TargetStats* ts = nullptr;
-    OnSceneDrawImpl(dev, d, ib, ts);
-    if (ts) ts->motion += g_objStats.motionDraws - motion0, ts->mask += g_objStats.maskDraws - mask0;
+    if (g_resync) Resync(dev);
+    PollPipeline();
+    if (g_psTonemap && !g_pastTonemap) {
+        NativeRoundTrip(dev);
+        g_pastTonemap = true;
+    }
+    NativeJitter(dev);
+    if (!g_pastTonemap && g_bbWidth && ObjectsActive()) {
+        const uint32_t motion0 = g_objStats.motionDraws, mask0 = g_objStats.maskDraws;
+        TargetStats* ts = nullptr;
+        OnSceneDrawImpl(dev, d, ib, ts);
+        if (ts) ts->motion += g_objStats.motionDraws - motion0, ts->mask += g_objStats.maskDraws - mask0;
+    }
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
     g_objStats.cpuMs += (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
 }
 
 void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, TargetStats*& ts) {
-    IDirect3DSurface9* rt = nullptr;
-    if (FAILED(dev->GetRenderTarget(0, &rt)) || !rt) return;
-    const uintptr_t rtId = reinterpret_cast<uintptr_t>(rt);
+    if (!g_rt0Info || !g_vsObj) return;
+    const uintptr_t rtId = reinterpret_cast<uintptr_t>(g_rt0);
     if (!g_batch.empty() && rtId != g_batchTarget) FlushMotion(dev);  // the batch's pass ended
-    struct RtInfo {
-        UINT w, h;
-        IDirect3DTexture9* tex;  // compared only
-    };
-    static std::unordered_map<uintptr_t, RtInfo> rtCache;
-    auto rc = rtCache.find(rtId);
-    if (rc == rtCache.end()) {
-        D3DSURFACE_DESC rd = {};
-        rt->GetDesc(&rd);
-        IDirect3DTexture9* t = nullptr;
-        rt->GetContainer(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&t));
-        if (t) t->Release();
-        if (rtCache.size() > 4096) rtCache.clear();
-        rc = rtCache.emplace(rtId, RtInfo{rd.Width, rd.Height, t}).first;
-    }
-    rt->Release();
-    IDirect3DTexture9* rtTex = rc->second.tex;
-    if (rc->second.w != g_bbWidth || rc->second.h != g_bbHeight) return;
+    IDirect3DTexture9* rtTex = g_rt0Info->tex;
+    if (g_rt0Info->w != g_bbWidth || g_rt0Info->h != g_bbHeight) return;
     {
         auto ins = g_targetStats.try_emplace(reinterpret_cast<uintptr_t>(rtTex));
         ts = &ins.first->second;
         if (ins.second) ts->order = g_targetOrder++;
         ++ts->draws;
-        ts->depth = g_depthRes.handle && rtTex == reinterpret_cast<IDirect3DTexture9*>(g_depthRes.handle);
+        ts->depth = rtTex && rtTex == g_depthTexFrame;
     }
     if (ts->depth) return;  // depth pre-pass
-    IDirect3DVertexShader9* vs = nullptr;
-    if (FAILED(dev->GetVertexShader(&vs)) || !vs) return;
-    ObjVs& o = ObjVsInfo(vs);
-    vs->Release();  // the game holds it
+    ObjVs& o = *g_vsObj;
     if (o.vpReg < 0) return;  // screen-space pass
     DWORD blend = 0, zwrite = 0;
     dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
     dev->GetRenderState(D3DRS_ZWRITEENABLE, &zwrite);
 
-    if (blend && !zwrite) {  // world-space effect: snapshot of the scene before the first one (effect mask)
-        if (g_effectMaskOn && !g_fxSnapped && g_fxPrivSurf && rtTex && rtTex == g_sceneTexLast) {
-            g_fxSnapped = SUCCEEDED(dev->StretchRect(reinterpret_cast<IDirect3DSurface9*>(rtId), nullptr, g_fxPrivSurf, nullptr,
-                                                     D3DTEXF_NONE));
-            if (g_fxSnapped) ++g_objStats.maskDraws;
+    if (blend && !zwrite) {  // world-space effect: snapshot of its target before the first one (effect mask)
+        if (g_effectMaskOn && !g_fxSnapped && g_fxPrivSurf && rtTex && g_rt0Info->fmt == g_texFmt) {
+            g_fxSnapped = SUCCEEDED(dev->StretchRect(g_rt0, nullptr, g_fxPrivSurf, nullptr, D3DTEXF_NONE));
+            if (g_fxSnapped) {
+                ++g_objStats.maskDraws;
+                g_fxSnapTex = rtTex;
+                SafeRelease(g_fxTargetSurf);
+                g_fxTargetSurf = g_rt0;
+                g_fxTargetSurf->AddRef();
+            }
         }
         return;
     }
@@ -733,12 +933,8 @@ void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, Tar
     DrawKey k = {vb, ib, d.start, static_cast<uint32_t>(d.base), d.prims, 0};
     k.n = g_occurrence[k]++;
     DrawHist cur = {};
-    {
-        std::lock_guard<std::mutex> lock(g_ctxMutex);
-        const Context& c = g_contexts[reinterpret_cast<uint64_t>(dev)];
-        if (o.worldReg >= 0) memcpy(cur.world, c.vsConst + o.worldReg * 4, sizeof(cur.world));
-        if (o.skinReg >= 0) memcpy(cur.skin, c.vsConst + o.skinReg * 4, sizeof(cur.skin));
-    }
+    if (o.worldReg >= 0) memcpy(cur.world, g_vsF + o.worldReg * 4, sizeof(cur.world));
+    if (o.skinReg >= 0) memcpy(cur.skin, g_vsF + o.skinReg * 4, sizeof(cur.skin));
     g_histCur[k] = cur;
     if (o.boneSampler >= 0 && !g_boneTexThisFrame) {
         IDirect3DBaseTexture9* bt = nullptr;
@@ -758,20 +954,16 @@ void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, Tar
     uint64_t h = Fnv(1469598103934665603ull, &k, offsetof(DrawKey, n));  // geometry, not the occurrence
     h = Fnv(h, &cur, sizeof(cur));
     if (!g_replayed.insert(h).second) return;  // already replayed in the other colour pass
-    IDirect3DVertexShader9* gameVs = nullptr;
-    dev->GetVertexShader(&gameVs);
-    RecordMotion(dev, gameVs, o, it->second, d, rtId);
-    if (gameVs) gameVs->Release();
+    RecordMotion(dev, g_vs, o, it->second, d, rtId);
 }
 
 HRESULT STDMETHODCALLTYPE HookDip(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, INT base, UINT minV, UINT numV, UINT start,
                                   UINT prims) {
     if (g_inDrawHook) return g_dipFirst(dev, type, base, minV, numV, start, prims);  // another hook chained back to us
     g_inDrawHook = true;
-    PollPipeline();
     IDirect3DIndexBuffer9* ib = nullptr;
     if (SUCCEEDED(dev->GetIndices(&ib)) && ib) ib->Release();
-    OnSceneDraw(dev, DrawArgs{true, type, base, minV, numV, start, prims}, reinterpret_cast<uintptr_t>(ib));
+    BeforeDraw(dev, DrawArgs{true, type, base, minV, numV, start, prims}, reinterpret_cast<uintptr_t>(ib));
     const HRESULT hr = g_dip(dev, type, base, minV, numV, start, prims);
     g_inDrawHook = false;
     return hr;
@@ -780,8 +972,7 @@ HRESULT STDMETHODCALLTYPE HookDip(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, 
 HRESULT STDMETHODCALLTYPE HookDp(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type, UINT start, UINT prims) {
     if (g_inDrawHook) return g_dpFirst(dev, type, start, prims);
     g_inDrawHook = true;
-    PollPipeline();
-    OnSceneDraw(dev, DrawArgs{false, type, 0, 0, 0, start, prims}, 0);
+    BeforeDraw(dev, DrawArgs{false, type, 0, 0, 0, start, prims}, 0);
     const HRESULT hr = g_dp(dev, type, start, prims);
     g_inDrawHook = false;
     return hr;
@@ -797,27 +988,35 @@ std::string ModuleOf(const void* p) {
     return slash ? slash + 1 : name;
 }
 
-// Called at device creation and again at every present: the slots get replaced after creation,
-// so our hook goes back on top (and calls whatever is there now).
+template <typename Fn>
+bool HookSlot(void** vt, int slot, Fn hook, Fn& next, Fn& first) {
+    if (vt[slot] == reinterpret_cast<void*>(hook)) return false;
+    DWORD old;
+    if (!VirtualProtect(vt + slot, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
+    next = reinterpret_cast<Fn>(vt[slot]);
+    if (!first) first = next;
+    vt[slot] = reinterpret_cast<void*>(hook);
+    VirtualProtect(vt + slot, 4, old, &old);
+    return true;
+}
+
+// Called at device creation and again at every present: the slots get replaced after creation
+// (by d3d9.dll), so our hooks go back on top (and call whatever is there now).
 void HookDraws(IDirect3DDevice9* dev) {
     void** vt = *reinterpret_cast<void***>(dev);
-    if (vt[82] == reinterpret_cast<void*>(&HookDip) && vt[81] == reinterpret_cast<void*>(&HookDp)) return;
+    bool any = false;
+    any |= HookSlot<DpFn>(vt, 81, &HookDp, g_dp, g_dpFirst);
+    any |= HookSlot<DipFn>(vt, 82, &HookDip, g_dip, g_dipFirst);
+    any |= HookSlot<SetRtFn>(vt, 37, &HookSetRt, g_setRt, g_setRtFirst);
+    any |= HookSlot<SetVsFn>(vt, 92, &HookSetVs, g_setVs, g_setVsFirst);
+    any |= HookSlot<SetVsFFn>(vt, 94, &HookSetVsF, g_setVsF, g_setVsFFirst);
+    any |= HookSlot<SetPsFn>(vt, 107, &HookSetPs, g_setPs, g_setPsFirst);
+    if (!any) return;
+    g_resync = true;  // calls may have been missed while a slot wasn't ours
     static int hooks = 0;
-    DWORD old;
-    if (!VirtualProtect(vt + 81, 8, PAGE_EXECUTE_READWRITE, &old)) return;
-    if (vt[81] != reinterpret_cast<void*>(&HookDp)) {
-        g_dp = reinterpret_cast<DpFn>(vt[81]);
-        if (!g_dpFirst) g_dpFirst = g_dp;
-        vt[81] = reinterpret_cast<void*>(&HookDp);
-    }
-    if (vt[82] != reinterpret_cast<void*>(&HookDip)) {
-        g_dip = reinterpret_cast<DipFn>(vt[82]);
-        if (!g_dipFirst) g_dipFirst = g_dip;
-        vt[82] = reinterpret_cast<void*>(&HookDip);
-    }
-    VirtualProtect(vt + 81, 8, old, &old);
-    if (++hooks <= 4)
-        Log("objects: hooked draws (vtable %p), next in chain %p in %s", vt, g_dip, ModuleOf(reinterpret_cast<void*>(g_dip)).c_str());
+    if (++hooks <= 6)
+        Log("objects: hooked draws and state (vtable %p), next in chain %p in %s", vt, g_dip,
+            ModuleOf(reinterpret_cast<void*>(g_dip)).c_str());
 }
 
 // Last frame's bones: copy the bone texture into our own render target (it isn't one, so a
@@ -847,6 +1046,8 @@ void CopyBones() {
         Log("objects: bone texture %ux%u format %u", sd.Width, sd.Height, sd.Format);
     }
     IDirect3DDevice9* dev = g_d9;
+    const bool wasInHook = g_inDrawHook;
+    g_inDrawHook = true;  // our state changes: not tracked
     g_copyState->Capture();
     IDirect3DSurface9 *rt0 = nullptr, *ds = nullptr;
     dev->GetRenderTarget(0, &rt0);
@@ -887,6 +1088,7 @@ void CopyBones() {
     if (ds) ds->Release();
     for (IDirect3DSurface9* s : rts)
         if (s) s->Release();
+    g_inDrawHook = wasInHook;
     g_prevBonesValid = ok;
 }
 
@@ -905,10 +1107,28 @@ void ObjectsFrameEnd() {  // at present (after this frame's round trip)
     g_histCur.clear();
     g_occurrence.clear();
     g_objStatsLast = g_objStats;
+    static LARGE_INTEGER lastPresent = {};
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    static double frameMsSum = 0, drawEvSum = 0, objSum = 0;
+    static uint32_t frames = 0;
+    if (lastPresent.QuadPart) {
+        frameMsSum += (now.QuadPart - lastPresent.QuadPart) * 1000.0 / freq.QuadPart;
+        drawEvSum += g_drawEventMs, objSum += g_objStats.cpuMs, ++frames;
+    }
+    lastPresent = now;
+    g_drawEventMs = 0;
+    if (g_jitterIndex % 600 == 300 && frames) {
+        Log("frame time %.2f ms avg (%.0f fps); add-on CPU per frame %.2f ms (draw hook; ReShade draw events %.2f ms) (last %u frames)",
+            frameMsSum / frames, 1000.0 * frames / frameMsSum, objSum / frames, drawEvSum / frames, frames);
+        frameMsSum = drawEvSum = objSum = 0, frames = 0;
+    }
     if (g_jitterIndex % 600 == 300 && g_objStats.motionDraws + g_objStats.maskDraws > 0) {
-        Log("objects: last frame %u motion draws, %u mask draws, %u without history, %.2f ms CPU; shaders patched %u, failed %u",
-            g_objStats.motionDraws, g_objStats.maskDraws, g_objStats.skipped, g_objStats.cpuMs, g_objStats.patched,
-            g_objStats.failedPatch);
+        Log("objects: last frame %u motion draws, %u effect snapshots (%u used so far, %u not the tonemap's input), %u without "
+            "history, %.2f ms CPU; shaders patched %u, failed %u",
+            g_objStats.motionDraws, g_objStats.maskDraws, g_fxUsed, g_fxMismatch, g_objStats.skipped, g_objStats.cpuMs,
+            g_objStats.patched, g_objStats.failedPatch);
         std::vector<std::pair<uint32_t, std::pair<uintptr_t, TargetStats>>> v;
         for (const auto& e : g_targetStats) v.push_back({e.second.order, e});
         std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -924,4 +1144,6 @@ void ObjectsFrameEnd() {  // at present (after this frame's round trip)
     g_objStats.cpuMs = 0;
     g_objWritten = g_maskWritten = false;
     g_fxSnapped = false;
+    g_depthTexFrame = nullptr;
+    g_resync = true;  // ReShade's overlay restores state with a state block (no Set* calls)
 }

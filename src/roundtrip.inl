@@ -42,6 +42,11 @@ IDirect3DTexture9* g_fxPriv = nullptr;     // that copy (written during the scen
 IDirect3DSurface9* g_fxPrivSurf = nullptr;
 IDirect3DTexture9* g_fxShared = nullptr;   // copied to the helper at the tonemap draw
 bool g_fxSnapped = false;                  // this frame
+IDirect3DTexture9* g_fxSnapTex = nullptr;  // the texture it was taken from (compared only)
+IDirect3DSurface9* g_fxTargetSurf = nullptr;  // that target (AddRef'd): copied again at the tonemap, after the effects
+IDirect3DTexture9* g_fxAfter = nullptr;       // shared: the effect target after the effects
+uint32_t g_fxUsed = 0, g_fxMismatch = 0;
+double g_drawEventMs = 0;  // this frame: add-on time in ReShade's draw events (main.cpp)
 IDirect3DTexture9* g_sceneTexLast = nullptr;  // the tonemap's input texture (last seen; compared only)
 bool g_objMotionOn = true, g_effectMaskOn = true;  // settings
 bool g_pipelineOn = true;                // setting: pipelined hand-off
@@ -132,8 +137,9 @@ bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt, D3DFORMAT depthFmt) {
     if (g_fxPrivSurf) g_fxPrivSurf->Release(), g_fxPrivSurf = nullptr;
     if (g_fxPriv) g_fxPriv->Release(), g_fxPriv = nullptr;
     if (g_fxShared) g_fxShared->Release(), g_fxShared = nullptr;
+    if (g_fxAfter) g_fxAfter->Release(), g_fxAfter = nullptr;
     g_haveResult = false;
-    HANDLE hin = nullptr, hout = nullptr, hdepth = nullptr, hobj = nullptr, hfx = nullptr;
+    HANDLE hin = nullptr, hout = nullptr, hdepth = nullptr, hobj = nullptr, hfx = nullptr, hfxa = nullptr;
     HRESULT hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_inTex, &hin);
     if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_outTex, &hout);
     if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, depthFmt, D3DPOOL_DEFAULT, &g_depthTex, &hdepth);
@@ -146,7 +152,8 @@ bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt, D3DFORMAT depthFmt) {
     if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_fxPriv, nullptr);
     if (SUCCEEDED(hr)) hr = g_fxPriv->GetSurfaceLevel(0, &g_fxPrivSurf);
     if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_fxShared, &hfx);
-    if (FAILED(hr) || !hin || !hout || !hdepth || !hobj || !hfx) {
+    if (SUCCEEDED(hr)) hr = g_d9->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &g_fxAfter, &hfxa);
+    if (FAILED(hr) || !hin || !hout || !hdepth || !hobj || !hfx || !hfxa) {
         g_rtStatus = Format("shared texture creation failed (0x%08lx)", hr);
         Log("%s", g_rtStatus.c_str());
         return false;
@@ -158,6 +165,7 @@ bool EnsureTextures(UINT w, UINT h, D3DFORMAT fmt, D3DFORMAT depthFmt) {
     g_ctl->depthHandle = reinterpret_cast<uintptr_t>(hdepth);
     g_ctl->objHandle = reinterpret_cast<uintptr_t>(hobj);
     g_ctl->fxHandle = reinterpret_cast<uintptr_t>(hfx);
+    g_ctl->fxAfterHandle = reinterpret_cast<uintptr_t>(hfxa);
     g_ctl->width = w, g_ctl->height = h;
     g_ctl->format = DxgiOf(fmt);
     ++g_ctl->generation;
@@ -315,10 +323,16 @@ void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
     g_objShared->GetSurfaceLevel(0, &osh);
     const bool depthOk = dsrc && dsh && SUCCEEDED(g_d9->StretchRect(dsrc, nullptr, dsh, nullptr, D3DTEXF_NONE));
     if (osh && g_objSurf) g_d9->StretchRect(g_objSurf, nullptr, osh, nullptr, D3DTEXF_NONE);
-    if (g_fxSnapped && g_fxPrivSurf) {
-        IDirect3DSurface9* fsh = nullptr;
+    if (g_fxSnapped && g_fxPrivSurf && g_fxTargetSurf) {  // before and after the effects, for the effect mask
+        ++g_fxUsed;
+        if (g_fxSnapTex != scene) ++g_fxMismatch;  // effects drawn into their own target (counted, fine)
+        IDirect3DSurface9 *fsh = nullptr, *fa = nullptr;
         g_fxShared->GetSurfaceLevel(0, &fsh);
+        g_fxAfter->GetSurfaceLevel(0, &fa);
         if (fsh) g_d9->StretchRect(g_fxPrivSurf, nullptr, fsh, nullptr, D3DTEXF_NONE), fsh->Release();
+        if (fa) g_d9->StretchRect(g_fxTargetSurf, nullptr, fa, nullptr, D3DTEXF_NONE), fa->Release();
+    } else {
+        g_fxSnapped = false;
     }
     const bool copied = src && in && out && SUCCEEDED(g_d9->StretchRect(src, nullptr, in, nullptr, D3DTEXF_NONE));
     if (!copied) {

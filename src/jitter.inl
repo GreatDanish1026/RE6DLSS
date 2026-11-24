@@ -109,10 +109,8 @@ uint32_t g_vsOffC1 = 0;                          // shaders seen with fViewProj 
 int ViewProjRegister(IDirect3DDevice9* dev) {
     IDirect3DVertexShader9* vs = nullptr;
     if (FAILED(dev->GetVertexShader(&vs)) || !vs) return -1;
-    UINT size = 0;
-    vs->GetFunction(nullptr, &size);
     VsInfo& info = g_vsInfo[reinterpret_cast<uintptr_t>(vs)];
-    if (info.size != size) {  // new shader (or a new one at a reused address)
+    if (!info.size) {  // new shader (the game keeps its shaders, so known by address)
         info.vpReg = FindViewProjRegister(vs, info.size);
         if (info.vpReg > 1 && ++g_vsOffC1 <= 8) Log("vertex shader %p: fViewProj in c%d", vs, info.vpReg);
     }

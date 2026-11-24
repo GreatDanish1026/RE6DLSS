@@ -805,10 +805,19 @@ void Other(command_list* cl) {
     ++c.draws;
 }
 
+struct DrawEventTimer {
+    LARGE_INTEGER t0;
+    DrawEventTimer() { QueryPerformanceCounter(&t0); }
+    ~DrawEventTimer() {
+        LARGE_INTEGER t1, f;
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&f);
+        g_drawEventMs += (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+    }
+};
+
 bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
-    MaybeRoundTrip(cl);
-    MarkTonemap(cl);
-    MaybeJitter(cl);
+    DrawEventTimer timer;
     if (!Recording()) return false;
     if (vertices <= 4 && instances == 1) Pass(cl, false, Format("draw %u verts", vertices));
     else Other(cl);
@@ -816,7 +825,7 @@ bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, u
 }
 
 bool OnDrawIndexed(command_list* cl, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
-    MaybeJitter(cl);
+    DrawEventTimer timer;
     if (!Recording()) return false;
     if (indices <= 6 && instances == 1) Pass(cl, false, Format("draw %u indices", indices));
     else Other(cl);
@@ -998,6 +1007,7 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
 
 int g_aa = 1;
 int g_model = 0;
+bool g_developer = false;  // ReShade.ini [RE6DLSS] Developer=1: ReShade's per-call events for the capture tool
 int g_debugRoundTrip = 0;  // 0 none, 1 copy, 2 invert (overrides DLAA while set)
 bool g_jitterTest = false;
 const char* const kModels[] = {"Automatic", "K", "J", "L", "M"};
@@ -1012,6 +1022,7 @@ void ApplySettings() {
 
 void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "CaptureHotkey", g_captureHotkey);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Developer", g_developer);
     reshade::get_config_value(nullptr, RD_PRODUCT, "AntiAliasing", g_aa);
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssModel", g_model);
     reshade::get_config_value(nullptr, RD_PRODUCT, "ObjectMotion", g_objMotionOn);
@@ -1119,28 +1130,30 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
             reshade::register_event<reshade::addon_event::init_resource_view>(&OnInitView);
             reshade::register_event<reshade::addon_event::destroy_resource_view>(&OnDestroyView);
-            reshade::register_event<reshade::addon_event::map_buffer_region>(&OnMapBuffer);
-            reshade::register_event<reshade::addon_event::unmap_buffer_region>(&OnUnmapBuffer);
-            reshade::register_event<reshade::addon_event::update_buffer_region>(&OnUpdateBuffer);
-            reshade::register_event<reshade::addon_event::update_buffer_region_command>(&OnUpdateBufferCommand);
             reshade::register_event<reshade::addon_event::init_pipeline>(&OnInitPipeline);
             reshade::register_event<reshade::addon_event::destroy_pipeline>(&OnDestroyPipeline);
             reshade::register_event<reshade::addon_event::init_command_list>(&OnInitCommandList);
             reshade::register_event<reshade::addon_event::destroy_command_list>(&OnDestroyCommandList);
             reshade::register_event<reshade::addon_event::execute_secondary_command_list>(&OnSecondary);
-            reshade::register_event<reshade::addon_event::bind_pipeline>(&OnBindPipeline);
-            reshade::register_event<reshade::addon_event::push_descriptors>(&OnPushDescriptors);
-            reshade::register_event<reshade::addon_event::bind_viewports>(&OnBindViewports);
-            reshade::register_event<reshade::addon_event::push_constants>(&OnPushConstants);
-            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
-            reshade::register_event<reshade::addon_event::dispatch>(&OnDispatch);
-            reshade::register_event<reshade::addon_event::draw>(&OnDraw);
-            reshade::register_event<reshade::addon_event::draw_indexed>(&OnDrawIndexed);
-            reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(&OnIndirect);
-            reshade::register_event<reshade::addon_event::copy_resource>(&OnCopyResource);
-            reshade::register_event<reshade::addon_event::copy_texture_region>(&OnCopyTexture);
-            reshade::register_event<reshade::addon_event::resolve_texture_region>(&OnResolve);
-            reshade::register_event<reshade::addon_event::clear_render_target_view>(&OnClearRtv);
+            if (g_developer) {  // per-call events: only the capture tool needs them (they cost CPU time per draw)
+                reshade::register_event<reshade::addon_event::map_buffer_region>(&OnMapBuffer);
+                reshade::register_event<reshade::addon_event::unmap_buffer_region>(&OnUnmapBuffer);
+                reshade::register_event<reshade::addon_event::update_buffer_region>(&OnUpdateBuffer);
+                reshade::register_event<reshade::addon_event::update_buffer_region_command>(&OnUpdateBufferCommand);
+                reshade::register_event<reshade::addon_event::bind_pipeline>(&OnBindPipeline);
+                reshade::register_event<reshade::addon_event::push_descriptors>(&OnPushDescriptors);
+                reshade::register_event<reshade::addon_event::bind_viewports>(&OnBindViewports);
+                reshade::register_event<reshade::addon_event::push_constants>(&OnPushConstants);
+                reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
+                reshade::register_event<reshade::addon_event::dispatch>(&OnDispatch);
+                reshade::register_event<reshade::addon_event::draw>(&OnDraw);
+                reshade::register_event<reshade::addon_event::draw_indexed>(&OnDrawIndexed);
+                reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(&OnIndirect);
+                reshade::register_event<reshade::addon_event::copy_resource>(&OnCopyResource);
+                reshade::register_event<reshade::addon_event::copy_texture_region>(&OnCopyTexture);
+                reshade::register_event<reshade::addon_event::resolve_texture_region>(&OnResolve);
+                reshade::register_event<reshade::addon_event::clear_render_target_view>(&OnClearRtv);
+            }
             reshade::register_event<reshade::addon_event::present>(&OnPresent);
             reshade::register_overlay(RD_PRODUCT, &DrawOverlay);
             break;
