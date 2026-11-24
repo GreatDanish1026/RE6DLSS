@@ -690,6 +690,7 @@ IDirect3DVertexShader9* g_vs = nullptr;
 ObjVs* g_vsObj = nullptr;
 IDirect3DPixelShader9* g_ps = nullptr;
 bool g_psTonemap = false;
+bool g_drawSincePs = false;          // a draw happened since the last pixel shader change
 float g_vsF[256 * 4] = {};           // the game's vertex shader constants (without our jitter)
 int g_jitReg = -1;                   // our jittered fViewProj copy is on the device at this register
 bool g_jitDirty = false;             // the game partly overwrote it since
@@ -786,7 +787,16 @@ HRESULT STDMETHODCALLTYPE HookSetVs(IDirect3DDevice9* dev, IDirect3DVertexShader
 
 HRESULT STDMETHODCALLTYPE HookSetPs(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps) {
     if (g_inStateHook) return g_setPsFirst(dev, ps);
-    if (!g_inDrawHook) g_ps = ps, g_psTonemap = IsTonemapPs(ps);
+    if (!g_inDrawHook) {
+        // RenoDX swaps in its own version of the tonemap shader right after the game binds it (in
+        // ReShade's bind event, before any draw): the replacement is the tonemap pass too.
+        if (g_psTonemap && !g_drawSincePs && ps && ps != g_ps && !IsTonemapPs(ps)) {
+            g_psIsTonemap[reinterpret_cast<uintptr_t>(ps)] = true;
+            Log("objects: tonemap pixel shader %p replaced by %p (RenoDX)", g_ps, ps);
+        }
+        g_ps = ps, g_psTonemap = IsTonemapPs(ps);
+        g_drawSincePs = false;
+    }
     g_inStateHook = true;
     const HRESULT hr = g_setPs(dev, ps);
     g_inStateHook = false;
@@ -872,6 +882,7 @@ void BeforeDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, bool up 
     LARGE_INTEGER t0, t1, f;
     QueryPerformanceCounter(&t0);
     if (g_resync) Resync(dev);
+    g_drawSincePs = true;
     PollPipeline();
     if (g_psTonemap && !g_pastTonemap) {
         static int logged = 0;
