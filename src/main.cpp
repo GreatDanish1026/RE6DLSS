@@ -522,28 +522,6 @@ bool OnCreateSwapchain(device_api api, swapchain_desc& desc, void* hwnd) {
     return true;
 }
 
-// Probe: which memory pools the game's resources use (9Ex has no managed pool).
-std::mutex g_heapMutex;
-std::map<std::pair<int, int>, uint32_t> g_heapCounts;  // (resource type, heap) -> count
-std::atomic<uint32_t> g_resCreated{0};
-
-bool OnCreateResourceProbe(device* dev, resource_desc& desc, subresource_data*, resource_usage) {
-    if (dev->get_api() != device_api::d3d9) return false;
-    ++g_resCreated;
-    std::lock_guard<std::mutex> lock(g_heapMutex);
-    ++g_heapCounts[{static_cast<int>(desc.type), static_cast<int>(desc.heap)}];
-    return false;
-}
-
-void LogHeapCounts(const char* when) {
-    std::lock_guard<std::mutex> lock(g_heapMutex);
-    std::string s;
-    static const char* const kType[] = {"unknown", "buffer", "texture1d", "texture2d", "texture3d", "surface"};
-    for (const auto& e : g_heapCounts)
-        s += Format(" %s/heap%d x%u", e.first.first >= 0 && e.first.first < 6 ? kType[e.first.first] : "?", e.first.second, e.second);
-    Log("resources %s: %u created;%s", when, g_resCreated.load(), s.c_str());
-}
-
 void OnInitDevice(device* dev) {
     if (dev->get_api() != device_api::d3d9) {
         Log("device: API %u", static_cast<unsigned>(dev->get_api()));
@@ -991,7 +969,6 @@ void OnPresent(command_queue* q, swapchain* sc, const rect*, const rect*, uint32
         return;
     }
     ++g_presents;
-    if (g_presents == 1 || g_presents % 3000 == 0) LogHeapCounts(g_presents == 1 ? "at the first frame" : "so far");
     g_rtDoneThisFrame = false;
     g_depthRes = {0};
     ObjectsFrameEnd();
@@ -1170,7 +1147,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             LoadSettings();
             reshade::register_event<reshade::addon_event::create_device>(&OnCreateDevice);
             reshade::register_event<reshade::addon_event::create_swapchain>(&OnCreateSwapchain);
-            reshade::register_event<reshade::addon_event::create_resource>(&OnCreateResourceProbe);
             reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
             reshade::register_event<reshade::addon_event::init_resource>(&OnInitResource);
             reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);

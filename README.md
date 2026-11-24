@@ -1,4 +1,4 @@
-# RE6DLSS 1.1.0
+# RE6DLSS 1.2.0
 
 ReShade add-on that adds **DLAA** (NVIDIA DLSS anti-aliasing at native resolution) to
 **Resident Evil 6** (Steam, `BH6.exe` 1.1.0.0). It replaces the game's FXAA/MSAA with DLSS's
@@ -84,6 +84,9 @@ ReShade overlay (Home key), Add-ons tab, **RE6DLSS**; saved in `ReShade.ini` und
 
 ## Changes
 
+- **1.2.0**: works without RenoDX: the add-on asks ReShade for the Direct3D 9Ex device itself
+  (the game then runs borderless windowed instead of exclusive fullscreen), and DLSS is set up for
+  the game's own 8-bit scene. With RenoDX nothing changes.
 - **1.1.0**: much lower cost: pipelined hand-off (no waiting on the game's thread) and the add-on
   follows the game's Direct3D 9 calls directly instead of ReShade's per-draw events; effect mask
   for see-through effects; optional character motion vectors; debug views.
