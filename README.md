@@ -1,4 +1,4 @@
-# RE6DLSS 1.0.0
+# RE6DLSS 1.0.1
 
 ReShade add-on that adds **DLAA** (NVIDIA DLSS anti-aliasing at native resolution) to
 **Resident Evil 6** (Steam, `BH6.exe` 1.1.0.0). It replaces the game's FXAA/MSAA with DLSS's
@@ -41,7 +41,8 @@ ReShade overlay (Home key), Add-ons tab, **RE6DLSS**; saved in `ReShade.ini` und
 ## How it works
 
 - **Jitter**: RE6 has no TAA, so the add-on adds DLAA's sub-pixel camera jitter itself, to the
-  camera's view-projection (vertex shader constants c1-c4) of the 3D scene's draws.
+  camera's view-projection (`fViewProj`, found in each vertex shader's constant table) of the 3D
+  scene's draws.
 - **Depth**: the game writes its depth into the colour channels of its first full-screen pass
   (24 bits split over R, G and B); the helper decodes it.
 - **Motion vectors**: the game has no velocity buffer, so camera motion is computed from depth
@@ -52,13 +53,22 @@ ReShade overlay (Home key), Add-ons tab, **RE6DLSS**; saved in `ReShade.ini` und
 
 ## Notes
 
-- **Cost**: about 3-4 ms per frame at 4K (DLSS itself ~2.8 ms, plus the hand-off). The game waits
-  for the helper each frame.
+- **Cost**: about 2.5-3.5 ms per frame at 4K on an RTX 5080 (helper ~2 ms: DLSS 1.4 ms plus input
+  passes and copy; the rest is the hand-off). The game waits for the helper each frame, so the
+  helper runs at high priority with Windows' power throttling turned off for it. The helper log
+  lists the GPU time of each step every 300 frames.
 - If the NVIDIA app's DLSS override (model preset) is set for this game, the driver uses that model
   whatever the DLSS model setting says.
 - Logs: `RE6DLSS.log` (add-on) and `RE6DLSS-helper64.log` (helper, including NVIDIA's NGX messages)
   next to `BH6.exe`.
 - Tested with Leon's campaign at 3840x2160 with RenoDX HDR on an RTX 5080.
+
+## Changes
+
+- **1.0.1**: fixed black shards on faces in cutscenes (cutscene character shaders keep the camera
+  matrix elsewhere, so they missed the jitter); fixed random 16-18 ms frames (Windows throttled the
+  helper); DLSS history resets on camera cuts; invalid colour values are removed before DLSS.
+- **1.0.0**: first release.
 
 ## Build
 
