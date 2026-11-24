@@ -261,19 +261,12 @@ IDirect3DVertexShader9* g_copyVs = nullptr;
 IDirect3DVertexDeclaration9* g_copyDecl = nullptr;
 IDirect3DStateBlock9* g_copyState = nullptr;
 bool g_objShadersTried = false, g_objShadersOk = false;
-bool g_objWritten = false, g_maskWritten = false;  // this frame (sent to the helper)
 std::string g_objStatus = "not started";
 
 struct ObjStats {
     uint32_t motionDraws = 0, maskDraws = 0, skipped = 0, failedPatch = 0, patched = 0;
     double cpuMs = 0;  // time spent in OnSceneDraw (replays included) this frame
 } g_objStats, g_objStatsLast;
-struct TargetStats {
-    uint32_t order = 0, draws = 0, skinned = 0, rigid = 0, motion = 0, mask = 0;
-    bool depth = false;
-};
-std::map<uintptr_t, TargetStats> g_targetStats;  // per render target 0 texture, this frame
-uint32_t g_targetOrder = 0;
 // The scene has two colour passes; a character part can be drawn in either or both. Each moving
 // draw is replayed once per frame: same geometry with the same bone offset / world matrix = done.
 std::unordered_set<uint64_t> g_replayed;
@@ -596,7 +589,7 @@ void FlushMotion(IDirect3DDevice9* dev) {
         if (!last || last->cull != m.cull) dev->SetRenderState(D3DRS_CULLMODE, m.cull);
         if (!last || last->depthBias != m.depthBias) dev->SetRenderState(D3DRS_DEPTHBIAS, m.depthBias);
         if (!last || last->slopeBias != m.slopeBias) dev->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, m.slopeBias);
-        if (SUCCEEDED(Redraw(dev, m.d))) ++g_objStats.motionDraws, g_objWritten = true;
+        if (SUCCEEDED(Redraw(dev, m.d))) ++g_objStats.motionDraws;
         last = &m;
     }
     // Restore.
@@ -637,25 +630,6 @@ void FlushMotion(IDirect3DDevice9* dev) {
     g_batchTarget = 0;
     ++g_batches;
     g_inDrawHook = wasInHook;
-}
-
-void ReplayMask(IDirect3DDevice9* dev, const DrawArgs& d) {
-    SavedTargets targets;
-    targets.Save(dev);
-    SavedStates states;
-    states.Save(dev);
-    dev->SetRenderTarget(0, g_objSurf);
-    for (DWORD i = 1; i < 4; ++i) dev->SetRenderTarget(i, nullptr);
-    dev->SetViewport(&targets.vp);
-    dev->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_ALPHA);
-    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
-    dev->SetRenderState(D3DRS_BLENDOPALPHA, D3DBLENDOP_MAX);
-    dev->SetRenderState(D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
-    dev->SetRenderState(D3DRS_DESTBLENDALPHA, D3DBLEND_ONE);
-    dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-    if (SUCCEEDED(Redraw(dev, d))) ++g_objStats.maskDraws, g_maskWritten = true;
-    states.Restore(dev);
-    targets.Restore(dev);
 }
 
 // ---- native state tracking
@@ -874,7 +848,7 @@ void NativeRoundTrip(IDirect3DDevice9* dev) {
     tex->Release();
 }
 
-void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, TargetStats*& ts);
+void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib);
 
 // Everything the add-on does before a game draw. `up`: DrawPrimitiveUP / DrawIndexedPrimitiveUP
 // (vertices from memory: full-screen quads such as the tonemap pass; never replayed).
@@ -892,30 +866,20 @@ void BeforeDraw(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, bool up 
     }
     NativeJitter(dev);
     if (!up && !g_pastTonemap && g_bbWidth && ObjectsActive()) {
-        const uint32_t motion0 = g_objStats.motionDraws, mask0 = g_objStats.maskDraws;
-        TargetStats* ts = nullptr;
-        OnSceneDrawImpl(dev, d, ib, ts);
-        if (ts) ts->motion += g_objStats.motionDraws - motion0, ts->mask += g_objStats.maskDraws - mask0;
+        OnSceneDrawImpl(dev, d, ib);
     }
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
     g_objStats.cpuMs += (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
 }
 
-void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, TargetStats*& ts) {
+void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib) {
     if (!g_rt0Info || !g_vsObj) return;
     const uintptr_t rtId = reinterpret_cast<uintptr_t>(g_rt0);
     if (!g_batch.empty() && rtId != g_batchTarget) FlushMotion(dev);  // the batch's pass ended
     IDirect3DTexture9* rtTex = g_rt0Info->tex;
     if (g_rt0Info->w != g_bbWidth || g_rt0Info->h != g_bbHeight) return;
-    {
-        auto ins = g_targetStats.try_emplace(reinterpret_cast<uintptr_t>(rtTex));
-        ts = &ins.first->second;
-        if (ins.second) ts->order = g_targetOrder++;
-        ++ts->draws;
-        ts->depth = rtTex && rtTex == g_depthTexFrame;
-    }
-    if (ts->depth) return;  // depth pre-pass
+    if (rtTex && rtTex == g_depthTexFrame) return;  // depth pre-pass
     ObjVs& o = *g_vsObj;
     if (o.vpReg < 0) return;  // screen-space pass
     DWORD blend = 0, zwrite = 0;
@@ -935,8 +899,6 @@ void OnSceneDrawImpl(IDirect3DDevice9* dev, const DrawArgs& d, uintptr_t ib, Tar
         }
         return;
     }
-    if (o.boneSampler >= 0) ++ts->skinned;
-    else if (o.worldReg >= 0) ++ts->rigid;
     if (!g_objMotionOn || !zwrite || (o.worldReg < 0 && o.boneSampler < 0)) return;
     // History of this draw (keyed by its geometry and how often it was drawn so far this frame).
     IDirect3DVertexBuffer9* vbp = nullptr;
@@ -1152,38 +1114,25 @@ void ObjectsFrameEnd() {  // at present (after this frame's round trip)
     LARGE_INTEGER now, freq;
     QueryPerformanceCounter(&now);
     QueryPerformanceFrequency(&freq);
-    static double frameMsSum = 0, drawEvSum = 0, objSum = 0;
+    static double frameMsSum = 0, objSum = 0;
     static uint32_t frames = 0;
     if (lastPresent.QuadPart) {
         frameMsSum += (now.QuadPart - lastPresent.QuadPart) * 1000.0 / freq.QuadPart;
-        drawEvSum += g_drawEventMs, objSum += g_objStats.cpuMs, ++frames;
+        objSum += g_objStats.cpuMs, ++frames;
     }
     lastPresent = now;
-    g_drawEventMs = 0;
-    if (g_jitterIndex % 600 == 300 && frames) {
-        Log("frame time %.2f ms avg (%.0f fps); add-on CPU per frame %.2f ms (draw hook; ReShade draw events %.2f ms) (last %u frames)",
-            frameMsSum / frames, 1000.0 * frames / frameMsSum, objSum / frames, drawEvSum / frames, frames);
-        frameMsSum = drawEvSum = objSum = 0, frames = 0;
+    if (g_jitterIndex % 1200 == 300 && frames) {
+        Log("frame time %.2f ms avg (%.0f fps); add-on time per frame on the game's render thread %.2f ms (last %u frames)",
+            frameMsSum / frames, 1000.0 * frames / frameMsSum, objSum / frames, frames);
+        frameMsSum = objSum = 0, frames = 0;
     }
-    if (g_jitterIndex % 600 == 300 && g_objStats.motionDraws + g_objStats.maskDraws > 0) {
-        Log("objects: last frame %u motion draws, %u effect snapshots (%u used so far, %u not the tonemap's input), %u without "
-            "history, %.2f ms CPU; shaders patched %u, failed %u",
-            g_objStats.motionDraws, g_objStats.maskDraws, g_fxUsed, g_fxMismatch, g_objStats.skipped, g_objStats.cpuMs,
-            g_objStats.patched, g_objStats.failedPatch);
-        std::vector<std::pair<uint32_t, std::pair<uintptr_t, TargetStats>>> v;
-        for (const auto& e : g_targetStats) v.push_back({e.second.order, e});
-        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-        for (const auto& e : v)
-            Log("  target %u (%p)%s: %u draws (%u skinned, %u rigid), %u motion replays, %u mask replays", e.first,
-                reinterpret_cast<void*>(e.second.first), e.second.second.depth ? " depth pre-pass" : "", e.second.second.draws,
-                e.second.second.skinned, e.second.second.rigid, e.second.second.motion, e.second.second.mask);
-    }
-    g_targetStats.clear();
-    g_targetOrder = 0;
+    if (g_jitterIndex % 1200 == 300 && g_objStats.motionDraws + g_objStats.maskDraws > 0)
+        Log("objects: last frame %u character/object motion draws, %u effect snapshots (%u used so far), %u without history; "
+            "vertex shaders patched %u, failed %u",
+            g_objStats.motionDraws, g_objStats.maskDraws, g_fxUsed, g_objStats.skipped, g_objStats.patched, g_objStats.failedPatch);
     g_replayed.clear();
     g_objStats.motionDraws = g_objStats.maskDraws = g_objStats.skipped = 0;
     g_objStats.cpuMs = 0;
-    g_objWritten = g_maskWritten = false;
     g_fxSnapped = false;
     g_depthTexFrame = nullptr;
     g_resync = true;  // ReShade's overlay restores state with a state block (no Set* calls)

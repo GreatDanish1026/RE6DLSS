@@ -46,9 +46,8 @@ IDirect3DTexture9* g_fxSnapTex = nullptr;  // the texture it was taken from (com
 IDirect3DSurface9* g_fxTargetSurf = nullptr;  // that target (AddRef'd): copied again at the tonemap, after the effects
 IDirect3DTexture9* g_fxAfter = nullptr;       // shared: the effect target after the effects
 uint32_t g_fxUsed = 0, g_fxMismatch = 0;
-double g_drawEventMs = 0;  // this frame: add-on time in ReShade's draw events (main.cpp)
 IDirect3DTexture9* g_sceneTexLast = nullptr;  // the tonemap's input texture (last seen; compared only)
-bool g_objMotionOn = true, g_effectMaskOn = true;  // settings
+bool g_objMotionOn = false, g_effectMaskOn = true;  // settings (character motion: opt-in, costs CPU time per character)
 bool g_pipelineOn = true;                // setting: pipelined hand-off
 int g_debugView = 0;                     // developer: 1 motion vectors, 2 effect mask
 D3DFORMAT g_depthFmt = D3DFMT_UNKNOWN;
@@ -221,7 +220,6 @@ void Signal(const FrameParams& p, DWORD timeout) {
     memcpy(g_ctl->prevViewProj, p.prevViewProj, sizeof(p.prevViewProj));
     g_ctl->havePrev = p.havePrev, g_ctl->reset = p.reset, g_ctl->preset = p.preset;
     g_ctl->objFlags = p.objFlags, g_ctl->debugView = p.debugView;
-    g_ctl->async = 0, g_ctl->checkMarker = 0;
     ResetEvent(g_done);  // a late answer to an earlier frame must not count for this one
     SetEvent(g_go);
     g_inFlight = true;
@@ -374,30 +372,3 @@ void RoundTrip(IDirect3DTexture9* scene, IDirect3DTexture9* depth) {
                         g_rtMsAvg, g_ctl->helperGpuMs, g_ctl->helperStatus);
 }
 
-// Called from the draw event (before the game's draw runs).
-void MaybeRoundTrip(command_list* cl) {
-    if (!g_rtMode || g_rtFailed || g_rtDoneThisFrame || !g_d9) return;
-    resource_view view = {0};
-    {
-        std::lock_guard<std::mutex> lock(g_ctxMutex);
-        Context& c = Ctx(cl);
-        if (c.ps.shader.id != kTonemapPs) return;
-        auto it = c.ps.srv.find(0);
-        if (it == c.ps.srv.end()) return;
-        view = it->second;
-    }
-    ViewInfo info;
-    if (!FindView(view, &info) || !info.res.handle) return;
-    auto* res = reinterpret_cast<IDirect3DResource9*>(info.res.handle);
-    IDirect3DTexture9* tex = nullptr;
-    if (FAILED(res->QueryInterface(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&tex))) || !tex) return;
-    g_rtDoneThisFrame = true;
-    g_sceneTexLast = tex;
-    IDirect3DTexture9* depth = nullptr;
-    if (g_depthRes.handle)
-        reinterpret_cast<IDirect3DResource9*>(g_depthRes.handle)
-            ->QueryInterface(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&depth));
-    RoundTrip(tex, depth);
-    if (depth) depth->Release();
-    tex->Release();
-}

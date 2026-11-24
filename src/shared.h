@@ -37,8 +37,6 @@ struct SharedControl {
     uint64_t objHandle;      // A16B16G16R16F: rg object motion in pixels (previous - current), b 1 = valid, a effect mask
     uint32_t objFlags;       // kObj*
     uint32_t debugView;      // 0 off, 1 motion vectors, 2 effect mask (shown instead of the picture)
-    uint32_t async;          // 1: answer once the work is submitted (GPU order kept by the OS), not when done
-    uint32_t checkMarker;    // non-zero: copy the input's top-left pixel to the output's (order check)
     // version 5
     uint64_t fxHandle;       // the effect target just before its first see-through effect
     uint64_t fxAfterHandle;  // the same target after them (effect mask = what changed)

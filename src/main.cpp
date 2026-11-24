@@ -450,7 +450,6 @@ struct Context {
     float vsConst[256 * 4] = {}, psConst[224 * 4] = {};  // D3D9 float constant registers
     bool dumpVsNext = false;
     bool sceneTarget = false;  // render target 0 is back-buffer sized (jitter)
-    int jitteredReg = -1;      // first register of our jittered fViewProj copy on the device, -1 none
     viewport vp = {};
     std::vector<resource_view> rtvs;
     resource_view dsv = {0};
@@ -483,12 +482,6 @@ Stage* StageOf(Context& c, shader_stage s) {
 #include "jitter.inl"
 #include "roundtrip.inl"
 #include "objects.inl"
-
-void MarkTonemap(command_list* cl) {  // the tonemap draw ends the scene phase (jitter)
-    if (g_pastTonemap) return;
-    std::lock_guard<std::mutex> lock(g_ctxMutex);
-    if (Ctx(cl).ps.shader.id == kTonemapPs) g_pastTonemap = true;
-}
 
 void OnInitDevice(device* dev) {
     if (dev->get_api() != device_api::d3d9) {
@@ -571,9 +564,6 @@ void OnPushConstants(command_list* cl, shader_stage stages, pipeline_layout, uin
     if (!dst || first >= cap) return;
     if (first + count > cap) count = cap - first;
     memcpy(dst + first, values, count * 4);
-    if (dst == c.vsConst && c.jitteredReg >= 0 && first <= static_cast<uint32_t>(c.jitteredReg) * 4 &&
-        first + count >= static_cast<uint32_t>(c.jitteredReg) * 4 + 16)
-        c.jitteredReg = -1;  // the game rewrote the whole jittered matrix
 }
 
 void OnBindViewports(command_list* cl, uint32_t first, uint32_t count, const viewport* vps) {
@@ -805,19 +795,7 @@ void Other(command_list* cl) {
     ++c.draws;
 }
 
-struct DrawEventTimer {
-    LARGE_INTEGER t0;
-    DrawEventTimer() { QueryPerformanceCounter(&t0); }
-    ~DrawEventTimer() {
-        LARGE_INTEGER t1, f;
-        QueryPerformanceCounter(&t1);
-        QueryPerformanceFrequency(&f);
-        g_drawEventMs += (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
-    }
-};
-
 bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
-    DrawEventTimer timer;
     if (!Recording()) return false;
     if (vertices <= 4 && instances == 1) Pass(cl, false, Format("draw %u verts", vertices));
     else Other(cl);
@@ -825,7 +803,6 @@ bool OnDraw(command_list* cl, uint32_t vertices, uint32_t instances, uint32_t, u
 }
 
 bool OnDrawIndexed(command_list* cl, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
-    DrawEventTimer timer;
     if (!Recording()) return false;
     if (indices <= 6 && instances == 1) Pass(cl, false, Format("draw %u indices", indices));
     else Other(cl);
@@ -1064,20 +1041,22 @@ void DrawOverlay(effect_runtime*) {
     static const char* const kAa[] = {"Off", "DLAA"};
     if (ImGui::Combo("Anti-aliasing", &g_aa, kAa, 2)) SaveSettings();
     Help("DLAA: NVIDIA DLSS at native resolution, in place of the game's anti-aliasing (set the game's "
-         "anti-aliasing to Off). Needs an NVIDIA RTX GPU and RenoDX. Costs about 3-4 ms per frame at 4K.");
+         "anti-aliasing to Off). Needs an NVIDIA RTX GPU and RenoDX. Runs on the GPU alongside the game "
+         "(about 2.5 ms of GPU time per frame at 4K).");
     ImGui::BeginDisabled(!g_aa);
     if (ImGui::Combo("DLSS model", &g_model, kModels, 5)) SaveSettings();
     Help("Automatic: the model NVIDIA recommends (K for DLAA). The NVIDIA app's DLSS override, if set for "
          "this game, takes precedence.");
     if (ImGui::Checkbox("Character motion", &g_objMotionOn)) SaveSettings();
-    Help("Gives DLAA the movement of characters, enemies and moving objects (not only the camera's), so they "
-         "stay sharp without trails. Costs a little GPU time per character.");
+    Help("Gives DLAA the movement of characters, enemies and moving objects, not only the camera's. RE6's "
+         "characters already look clean without it; it costs CPU time for every character on screen (about "
+         "1 ms per frame with several NPCs), so it's off by default.");
     if (ImGui::Checkbox("Effect mask", &g_effectMaskOn)) SaveSettings();
     Help("Tells DLAA not to carry fire, smoke, sparks and other see-through effects over from earlier frames, "
          "so they don't smear.");
     if (ImGui::Checkbox("Pipelined (higher frame rate)", &g_pipelineOn)) SaveSettings();
     Help("The game doesn't wait for DLAA: each frame shows the previous frame's DLAA image, so the CPU and GPU "
-         "stay busy. The 3D image is one frame behind the HUD (about 7 ms at 150 fps). Off: every frame waits "
+         "stay busy. The 3D image is one frame behind the HUD (one frame of latency). Off: every frame waits "
          "for DLAA (about 2.5-3.5 ms per frame), no delay.");
     ImGui::EndDisabled();
 

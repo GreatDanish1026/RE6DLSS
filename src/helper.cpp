@@ -400,9 +400,8 @@ bool ReadTimestamps(Gpu& g, double& prep, double& dlss, double& copy, double& to
     return true;
 }
 
-// One frame. Normal hand-off: answer when the GPU has finished. Low-latency (ctl->async): answer
-// as soon as the work is submitted; the OS runs the GPU work of the two processes in submission
-// order, so the game's copy back (submitted after our answer) follows it.
+// One frame: answer once the GPU work is finished (the OS doesn't keep the two processes' GPU
+// work in order by itself, so the game must not touch the output before that).
 void Process(Gpu& g, SharedControl* ctl) {
     LARGE_INTEGER t0, t1, f;
     QueryPerformanceCounter(&t0);
@@ -420,19 +419,13 @@ void Process(Gpu& g, SharedControl* ctl) {
     if (ctl->mode == kModeInvert) FullScreen(g, g.outRtv, g.invert, &g.inSrv, 1);
     else if (ctl->mode == kModeDlaa) Dlaa(g, ctl);
     else g.ctx->CopyResource(g.out, g.in);
-    if (ctl->checkMarker) {  // order check: the input's top-left pixel goes to the output unchanged
-        const D3D11_BOX box = {0, 0, 0, 1, 1, 1};
-        g.ctx->CopySubresourceRegion(g.out, 0, 0, 0, 0, g.in, 0, &box);
-    }
     if (timed) {
         g.ctx->End(g.ts[3]);
         g.ctx->End(g.disjoint);
     }
     g.ctx->End(g.query);
     g.ctx->Flush();
-    const bool async = ctl->async != 0;
-    if (!async)
-        while (g.ctx->GetData(g.query, nullptr, 0, 0) == S_FALSE) YieldProcessor();
+    while (g.ctx->GetData(g.query, nullptr, 0, 0) == S_FALSE) YieldProcessor();
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
     const double wall = (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
@@ -442,19 +435,13 @@ void Process(Gpu& g, SharedControl* ctl) {
     t.wall += wall;
     t.maxWall = (std::max)(t.maxWall, wall);
     ++t.frames;
-    if (timed && async) {
-        g.timingPending = true;
-    } else if (timed && ReadTimestamps(g, prep, dlssMs, copy, gpu)) {
+    if (timed && ReadTimestamps(g, prep, dlssMs, copy, gpu)) {
         t.prep += prep, t.dlss += dlssMs, t.copy += copy, t.queue += wall - gpu;
         ++t.timed;
     }
     if (t.frames >= 300) {
         const double n = t.timed ? t.timed : 1;
-        if (async)
-            Log("last %u frames (low-latency): submit %.2f ms avg (max %.2f); GPU: prep passes %.2f, DLSS %.2f, copy %.2f (%u timed)",
-                t.frames, t.wall / t.frames, t.maxWall, t.prep / n, t.dlss / n, t.copy / n, t.timed);
-        else
-            Log("last %u frames: wall %.2f ms avg (max %.2f); GPU: prep passes %.2f, DLSS %.2f, copy %.2f; waiting for the GPU %.2f (%u timed)",
+        Log("last %u frames: wall %.2f ms avg (max %.2f); GPU: prep passes %.2f, DLSS %.2f, copy %.2f; waiting for the GPU %.2f (%u timed)",
                 t.frames, t.wall / t.frames, t.maxWall, t.prep / n, t.dlss / n, t.copy / n, t.queue / n, t.timed);
         t = Timing{};
     }
